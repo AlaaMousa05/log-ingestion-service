@@ -8,18 +8,26 @@
     "dev": "tsx src/index.ts",
     "build": "tsc",
     "start": "node dist/index.js",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+     "db:generate": "drizzle-kit generate",
+  "db:migrate": "drizzle-kit migrate"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "devDependencies": {
     "@types/node": "^26.2.0",
+    "@types/pg": "^8.21.0",
+    "drizzle-kit": "^0.31.10",
     "tsx": "^4.23.11",
     "typescript": "^7.0.2"
   },
   "dependencies": {
-    "fastify": "^5.11.2"
+    "dotenv": "^17.4.2",
+    "drizzle-orm": "^0.45.2",
+    "fastify": "^5.11.2",
+    "pg": "^8.22.0"
   },
   "type": "module"
 }
+
