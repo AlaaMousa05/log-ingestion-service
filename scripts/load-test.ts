@@ -1,4 +1,4 @@
-const TOTAL_LOGS = 150_000;
+const TOTAL_LOGS = 100_000;
 const BATCH_SIZE = 1_000;
 const URL = "http://localhost:8080/logs";
 
