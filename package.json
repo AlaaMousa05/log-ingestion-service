@@ -9,8 +9,8 @@
     "build": "tsc",
     "start": "node dist/index.js",
     "typecheck": "tsc --noEmit",
-     "db:generate": "drizzle-kit generate",
-  "db:migrate": "drizzle-kit migrate"
+    "db:generate": "drizzle-kit generate",
+    "db:migrate": "drizzle-kit migrate"
   },
   "keywords": [],
   "author": "",
@@ -20,7 +20,7 @@
     "@types/pg": "^8.21.0",
     "drizzle-kit": "^0.31.10",
     "tsx": "^4.23.11",
-    "typescript": "^7.0.2"
+    "typescript": "^5.9.2"
   },
   "dependencies": {
     "dotenv": "^17.4.2",
@@ -30,4 +30,3 @@
   },
   "type": "module"
 }
-

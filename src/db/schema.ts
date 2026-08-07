@@ -38,14 +38,17 @@ export const logs = pgTable(
       .defaultNow()
       .notNull(),
   },
-  (table) => ({
-    timestampIndex: index("logs_timestamp_idx")
-      .on(table.timestamp),
+ (table) => ({
+  timestampIndex: index("logs_timestamp_idx")
+    .on(table.timestamp),
 
-    serviceIndex: index("logs_service_idx")
-      .on(table.service),
+  serviceIndex: index("logs_service_idx")
+    .on(table.service),
 
-    levelIndex: index("logs_level_idx")
-      .on(table.level),
-  }),
+  levelIndex: index("logs_level_idx")
+    .on(table.level),
+
+  cursorIndex: index("logs_cursor_idx")
+    .on(table.timestamp, table.id),
+}),
 );
