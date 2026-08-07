@@ -106,3 +106,96 @@ export async function findLogs(query: LogQuery) {
     )
     .limit(query.limit + 1);
 }
+
+
+export interface AggregateQuery {
+  since: Date;
+  until: Date;
+  bucket: "1m" | "5m" | "1h" | "1d";
+  groupBy?: "service" | "level";
+  service?: string;
+  level?: string;
+  message?: string;
+  attributes?: Record<string, string>;
+}
+
+
+export async function aggregateLogs(
+  query: AggregateQuery,
+) {
+  const conditions = [
+    gte(logs.timestamp, query.since),
+    lt(logs.timestamp, query.until),
+  ];
+
+  if (query.service) {
+    conditions.push(
+      eq(logs.service, query.service),
+    );
+  }
+
+  if (query.level) {
+    conditions.push(
+      eq(logs.level, query.level),
+    );
+  }
+
+  if (query.message) {
+    conditions.push(
+      sql`LOWER(${logs.message}) LIKE ${`%${query.message.toLowerCase()}%`}`,
+    );
+  }
+
+  if (query.attributes) {
+    for (const [key, value] of Object.entries(query.attributes)) {
+      conditions.push(
+        sql`${logs.attributes} @> ${JSON.stringify({
+          [key]: value,
+        })}`,
+      );
+    }
+  }
+
+  const bucketExpression =
+    query.bucket === "1m"
+      ? sql`date_trunc('minute', ${logs.timestamp})`
+      : query.bucket === "5m"
+        ? sql`date_trunc('minute', ${logs.timestamp}) - 
+          ((extract(minute from ${logs.timestamp})::int % 5) * interval '1 minute')`
+        : query.bucket === "1h"
+          ? sql`date_trunc('hour', ${logs.timestamp})`
+          : sql`date_trunc('day', ${logs.timestamp})`;
+
+
+  const groupExpression =
+    query.groupBy === "service"
+      ? logs.service
+      : query.groupBy === "level"
+        ? logs.level
+        : sql`NULL`;
+
+
+  const queryBuilder = db
+  .select({
+    start: bucketExpression,
+    group: groupExpression,
+    count: sql<number>`count(*)`,
+  })
+  .from(logs)
+  .where(and(...conditions));
+
+
+if (query.groupBy) {
+  return queryBuilder
+    .groupBy(
+      bucketExpression,
+      groupExpression,
+    )
+    .orderBy(bucketExpression);
+}
+
+
+return queryBuilder
+  .groupBy(bucketExpression)
+  .orderBy(bucketExpression);
+}

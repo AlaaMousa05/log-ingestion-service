@@ -1,10 +1,11 @@
 import type { FastifyReply, FastifyRequest } from "fastify";
 import { ingestLogs } from "../services/logs.service.js";
-import { findLogs } from "../repositories/logs.repository.js";
+import { findLogs ,aggregateLogs } from "../repositories/logs.repository.js";
 import {
   encodeCursor,
   decodeCursor,
 } from "../utils/cursor.js";
+
 
 export async function ingestLogsController(
   request: FastifyRequest,
@@ -191,5 +192,113 @@ const rows = await findLogs({
             id: last.id,
           })
         : null,
+  });
+}
+
+
+
+
+export async function aggregateLogsController(
+  request: FastifyRequest,
+  reply: FastifyReply,
+) {
+  const query =
+    request.query as Record<string, string | undefined>;
+
+  if (!query.since || !query.until) {
+    return reply.status(400).send({
+      error: "since and until are required",
+    });
+  }
+
+  const since = new Date(query.since);
+  const until = new Date(query.until);
+
+  if (
+    Number.isNaN(since.getTime()) ||
+    Number.isNaN(until.getTime())
+  ) {
+    return reply.status(400).send({
+      error: "invalid timestamp",
+    });
+  }
+
+  if (until <= since) {
+    return reply.status(400).send({
+      error: "until must be after since",
+    });
+  }
+
+
+  const bucket = query.bucket;
+
+  if (
+    bucket !== "1m" &&
+    bucket !== "5m" &&
+    bucket !== "1h" &&
+    bucket !== "1d"
+  ) {
+    return reply.status(400).send({
+      error: "invalid bucket",
+    });
+  }
+
+
+  if (
+    query.group_by &&
+    query.group_by !== "service" &&
+    query.group_by !== "level"
+  ) {
+    return reply.status(400).send({
+      error: "invalid group_by",
+    });
+  }
+
+
+  const attributes: Record<string, string> = {};
+
+  for (const [key, value] of Object.entries(query)) {
+    if (key.startsWith("attr.")) {
+      attributes[key.slice(5)] = value!;
+    }
+  }
+
+
+  const result = await aggregateLogs({
+    since,
+    until,
+    bucket,
+    ...(query.service && {
+      service: query.service,
+    }),
+    ...(query.level && {
+      level: query.level,
+    }),
+    ...(query.q && {
+      message: query.q,
+    }),
+    ...(Object.keys(attributes).length > 0 && {
+      attributes,
+    }),
+    ...(query.group_by && {
+      groupBy: query.group_by as
+        | "service"
+        | "level",
+    }),
+  });
+
+
+  return reply.send({
+    buckets: result.map((row) => ({
+      start:
+        new Date(row.start as Date)
+          .toISOString(),
+
+      group:
+        row.group ?? null,
+
+      count:
+        Number(row.count),
+    })),
   });
 }
