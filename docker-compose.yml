@@ -31,5 +31,17 @@ services:
     command: >
       sh -c "npx drizzle-kit migrate && node dist/index.js"
 
+  test:
+    image: node:22-alpine
+    working_dir: /app
+    volumes:
+      - .:/app
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/log_ingestion
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: sh -c "npm ci && npx vitest run"
+
 volumes:
   postgres_data:
