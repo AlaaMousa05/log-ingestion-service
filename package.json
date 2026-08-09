@@ -4,14 +4,14 @@
   "description": "High-performance structured log ingestion, querying, and aggregation service built with TypeScript and PostgreSQL.",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
-    "dev": "tsx src/index.ts",
-    "build": "tsc",
-    "start": "node dist/index.js",
-    "typecheck": "tsc --noEmit",
-    "db:generate": "drizzle-kit generate",
-    "db:migrate": "drizzle-kit migrate"
-  },
+  "test": "vitest run",
+  "dev": "tsx src/index.ts",
+  "build": "tsc",
+  "start": "node dist/index.js",
+  "typecheck": "tsc --noEmit",
+  "db:generate": "drizzle-kit generate",
+  "db:migrate": "drizzle-kit migrate"
+},
   "keywords": [],
   "author": "",
   "license": "ISC",
@@ -19,7 +19,8 @@
     "@types/node": "^26.2.0",
     "@types/pg": "^8.21.0",
     "tsx": "^4.23.11",
-    "typescript": "^5.9.2"
+    "typescript": "^5.9.2",
+    "vitest": "^4.1.10"
   },
   "dependencies": {
     "dotenv": "^17.4.2",
