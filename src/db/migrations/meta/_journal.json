@@ -15,6 +15,13 @@
       "when": 1786136999808,
       "tag": "0001_mysterious_nighthawk",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1786306472807,
+      "tag": "0002_volatile_nightshade",
+      "breakpoints": true
     }
   ]
 }

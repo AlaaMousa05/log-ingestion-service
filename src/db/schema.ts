@@ -7,7 +7,7 @@ import {
   jsonb,
   index,
 } from "drizzle-orm/pg-core";
-
+import { sql } from "drizzle-orm";
 export const logs = pgTable(
   "logs",
   {
@@ -50,5 +50,8 @@ export const logs = pgTable(
 
   cursorIndex: index("logs_cursor_idx")
     .on(table.timestamp, table.id),
+
+    messageSearchIndex: index("logs_message_search_idx")
+  .using("gin", sql`LOWER(${table.message}) gin_trgm_ops`),
 }),
 );
