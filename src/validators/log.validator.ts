@@ -3,6 +3,7 @@ import {
   type LogAttributes,
   type LogEntry,
 } from "../types/log.types.js";
+import { parseIsoTimestamp } from "../utils/timestamp.js";
 
 const MAX_FUTURE_MS = 5 * 60 * 1000;
 
@@ -59,16 +60,16 @@ export function validateLogEntry(
     };
   }
 
-  const timestampMs = Date.parse(timestamp);
+  const parsedTimestamp = parseIsoTimestamp(timestamp);
 
-  if (Number.isNaN(timestampMs)) {
+  if (!parsedTimestamp) {
     return {
       valid: false,
       reason: "invalid timestamp",
     };
   }
 
-  if (timestampMs > Date.now() + MAX_FUTURE_MS) {
+  if (parsedTimestamp.getTime() > Date.now() + MAX_FUTURE_MS) {
     return {
       valid: false,
       reason: "timestamp cannot be more than five minutes in the future",

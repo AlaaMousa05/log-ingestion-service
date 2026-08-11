@@ -46,6 +46,34 @@ describe("validateLogEntry", () => {
     });
   });
 
+  it("rejects a parseable but non-ISO timestamp", () => {
+    const result = validateLogEntry({
+      timestamp: "August 9, 2026 20:00:00 UTC",
+      level: "info",
+      service: "auth",
+      message: "test",
+    });
+
+    expect(result).toEqual({
+      valid: false,
+      reason: "invalid timestamp",
+    });
+  });
+
+  it("rejects timestamps more than five minutes in the future", () => {
+    const result = validateLogEntry({
+      timestamp: new Date(Date.now() + 5 * 60 * 1_000 + 1).toISOString(),
+      level: "info",
+      service: "auth",
+      message: "test",
+    });
+
+    expect(result).toEqual({
+      valid: false,
+      reason: "timestamp cannot be more than five minutes in the future",
+    });
+  });
+
   it("rejects an invalid level", () => {
     const result = validateLogEntry({
       timestamp: "2026-08-09T20:00:00.000Z",
@@ -106,6 +134,20 @@ describe("validateLogEntry", () => {
       reason:
         "attributes must be a flat object with string, number, or boolean values",
     });
+  });
+
+  it("rejects attribute arrays", () => {
+    const result = validateLogEntry({
+      timestamp: "2026-08-09T20:00:00.000Z",
+      level: "info",
+      service: "auth",
+      message: "test",
+      attributes: {
+        ids: ["42"],
+      },
+    });
+
+    expect(result.valid).toBe(false);
   });
 
   it("rejects non-finite numeric attributes", () => {

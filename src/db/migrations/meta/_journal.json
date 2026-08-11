@@ -22,6 +22,13 @@
       "when": 1786306472807,
       "tag": "0002_volatile_nightshade",
       "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1786396062699,
+      "tag": "0003_add_attributes_text_and_composite_indexes",
+      "breakpoints": true
     }
   ]
 }

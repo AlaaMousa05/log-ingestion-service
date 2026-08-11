@@ -1,0 +1,1659 @@
+diff --git a/Dockerfile b/Dockerfile
+index ad94b24..39e9bef 100644
+--- a/Dockerfile
++++ b/Dockerfile
+@@ -23,6 +23,10 @@ COPY --from=builder /app/dist ./dist
+ COPY --from=builder /app/drizzle.config.ts ./drizzle.config.ts
+ COPY --from=builder /app/src/db/migrations ./src/db/migrations
+ 
++RUN chown -R node:node /app
++
++USER node
++
+ EXPOSE 8080
+ 
+ CMD ["node", "dist/index.js"]
+diff --git a/docker-compose.yml b/docker-compose.yml
+index d8fb737..f5e6711 100644
+--- a/docker-compose.yml
++++ b/docker-compose.yml
+@@ -1,13 +1,12 @@
+ services:
+   postgres:
+-    image: postgres:18
++    image: postgres:18.4
+     container_name: log-ingestion-postgres
++    restart: unless-stopped
+     environment:
+       POSTGRES_DB: log_ingestion
+       POSTGRES_USER: postgres
+-      POSTGRES_PASSWORD: postgres
+-    ports:
+-      - "5432:5432"
++      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+     volumes:
+       - postgres_data:/var/lib/postgresql
+     healthcheck:
+@@ -15,14 +14,20 @@ services:
+       interval: 5s
+       timeout: 5s
+       retries: 10
++      start_period: 10s
++    cpus: "1.0"
++    mem_limit: 1g
+ 
+   app:
+     build: .
+     container_name: log-ingestion-app
++    restart: unless-stopped
+     environment:
+-      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/log_ingestion
++      DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD:-postgres}@postgres:5432/log_ingestion
+       PORT: 8080
+-      RETENTION_DAYS: 30
++      RETENTION_DAYS: ${RETENTION_DAYS:-30}
++      RETENTION_BATCH_SIZE: ${RETENTION_BATCH_SIZE:-1000}
++      RETENTION_MAX_BATCHES: ${RETENTION_MAX_BATCHES:-10}
+     ports:
+       - "8080:8080"
+     depends_on:
+@@ -30,18 +35,27 @@ services:
+         condition: service_healthy
+     command: >
+       sh -c "npx drizzle-kit migrate && node dist/index.js"
++    healthcheck:
++      test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1:8080/health > /dev/null || exit 1"]
++      interval: 10s
++      timeout: 3s
++      retries: 10
++      start_period: 15s
++    cpus: "0.5"
++    mem_limit: 256m
+ 
+   test:
++    profiles: ["test"]
+     image: node:22-alpine
+     working_dir: /app
+     volumes:
+       - .:/app
+     environment:
+-      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/log_ingestion
++      DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD:-postgres}@postgres:5432/log_ingestion
+     depends_on:
+       postgres:
+         condition: service_healthy
+-    command: sh -c "npm ci && npx vitest run"
++    command: sh -c "npm ci && npx drizzle-kit migrate && npx vitest run"
+ 
+ volumes:
+   postgres_data:
+diff --git a/package.json b/package.json
+index 6a3546a..d64744b 100644
+--- a/package.json
++++ b/package.json
+@@ -4,14 +4,15 @@
+   "description": "High-performance structured log ingestion, querying, and aggregation service built with TypeScript and PostgreSQL.",
+   "main": "index.js",
+   "scripts": {
+-  "test": "vitest run",
+-  "dev": "tsx src/index.ts",
+-  "build": "tsc",
+-  "start": "node dist/index.js",
+-  "typecheck": "tsc --noEmit",
+-  "db:generate": "drizzle-kit generate",
+-  "db:migrate": "drizzle-kit migrate"
+-},
++    "test": "vitest run",
++    "dev": "tsx src/index.ts",
++    "build": "tsc",
++    "start": "node dist/index.js",
++    "typecheck": "tsc --noEmit",
++    "db:generate": "drizzle-kit generate",
++    "db:migrate": "drizzle-kit migrate",
++    "load-test": "tsx scripts/load-test.ts"
++  },
+   "keywords": [],
+   "author": "",
+   "license": "ISC",
+diff --git a/scripts/load-test.ts b/scripts/load-test.ts
+index 50636ba..e49192a 100644
+--- a/scripts/load-test.ts
++++ b/scripts/load-test.ts
+@@ -1,63 +1,248 @@
+-const TOTAL_LOGS = 100_000;
+-const BATCH_SIZE = 1_000;
+-const URL = "http://localhost:8080/logs";
++import { execFile } from "node:child_process";
++import { promisify } from "node:util";
+ 
+-const levels = ["info", "warn", "error"];
++const execFileAsync = promisify(execFile);
++
++function positiveInteger(name: string, fallback: number): number {
++  const value = process.env[name];
++
++  if (value === undefined) {
++    return fallback;
++  }
++
++  const parsed = Number(value);
++
++  if (!Number.isSafeInteger(parsed) || parsed < 1) {
++    throw new Error(`${name} must be a positive integer`);
++  }
++
++  return parsed;
++}
++
++const totalLogs = positiveInteger("TOTAL_LOGS", 1_000_000);
++const batchSize = positiveInteger("BATCH_SIZE", 1_000);
++const workers = positiveInteger("WORKERS", 4);
++const url = process.env.LOG_SERVICE_URL ?? "http://localhost:8080";
++const captureDockerStats = process.env.CAPTURE_DOCKER_STATS === "true";
++
++const levels = ["debug", "info", "warn", "error"] as const;
+ const services = ["auth", "checkout", "payments", "orders"];
++const monthMs = 30 * 24 * 60 * 60 * 1_000;
++
++interface DockerSample {
++  timestamp: string;
++  container: string;
++  cpu: string;
++  memory: string;
++}
+ 
+-const start = Date.now();
++const ingestionLatencies: number[] = [];
++const aggregationLatencies: number[] = [];
++const dockerSamples: DockerSample[] = [];
+ let accepted = 0;
++let rejected = 0;
++let failedRequests = 0;
++let aggregationRequests = 0;
++let aggregationErrors = 0;
++let nextOffset = 0;
++let keepAggregating = true;
+ 
+-for (let offset = 0; offset < TOTAL_LOGS; offset += BATCH_SIZE) {
+-  const size = Math.min(BATCH_SIZE, TOTAL_LOGS - offset);
+-
+-  const logs = Array.from({ length: size }, (_, i) => ({
+-    timestamp: new Date(
+-      Date.now() - ((offset + i) % 86_400_000),
+-    ).toISOString(),
+-    level: levels[(offset + i) % levels.length],
+-    service: services[(offset + i) % services.length],
+-    message: `load test log ${offset + i}`,
+-    attributes: {
+-      user_id: String((offset + i) % 1000),
+-      region: "eu-west",
+-      request_id: `req-${offset + i}`,
+-    },
+-  }));
+-
+-  const response = await fetch(URL, {
+-    method: "POST",
+-    headers: {
+-      "Content-Type": "application/json",
+-    },
+-    body: JSON.stringify({ logs }),
++function percentile(values: number[], p: number): number | null {
++  if (values.length === 0) {
++    return null;
++  }
++
++  const sorted = [...values].sort((a, b) => a - b);
++  const index = Math.min(sorted.length - 1, Math.ceil(sorted.length * p) - 1);
++  return sorted[index] ?? null;
++}
++
++function formatLatency(values: number[]) {
++  return {
++    count: values.length,
++    min_ms: values.length ? Math.min(...values) : null,
++    p50_ms: percentile(values, 0.5),
++    p95_ms: percentile(values, 0.95),
++    p99_ms: percentile(values, 0.99),
++    max_ms: values.length ? Math.max(...values) : null,
++  };
++}
++
++function createBatch(offset: number, size: number) {
++  const now = Date.now();
++
++  return Array.from({ length: size }, (_, index) => {
++    const sequence = offset + index;
++
++    return {
++      // Spread the generated data across approximately one month, rather than
++      // making adjacent sequence numbers only milliseconds apart.
++      timestamp: new Date(
++        now - Math.floor((sequence / totalLogs) * monthMs),
++      ).toISOString(),
++      level: levels[sequence % levels.length],
++      service: services[sequence % services.length],
++      message: `benchmark log ${sequence}`,
++      attributes: {
++        user_id: String(sequence % 10_000),
++        region: sequence % 2 === 0 ? "eu-west" : "us-east",
++        retries: sequence % 4,
++        sampled: sequence % 2 === 0,
++      },
++    };
+   });
++}
++
++async function ingestWorker() {
++  while (true) {
++    const offset = nextOffset;
++    nextOffset += batchSize;
++
++    if (offset >= totalLogs) {
++      return;
++    }
+ 
+-  if (!response.ok) {
+-    console.error(
+-      `Batch failed at offset ${offset}: ${response.status}`,
+-    );
+-    console.error(await response.text());
+-    process.exit(1);
++    const logs = createBatch(offset, Math.min(batchSize, totalLogs - offset));
++    const startedAt = performance.now();
++
++    try {
++      const response = await fetch(`${url}/logs`, {
++        method: "POST",
++        headers: { "content-type": "application/json" },
++        body: JSON.stringify({ logs }),
++      });
++      const elapsed = performance.now() - startedAt;
++      ingestionLatencies.push(elapsed);
++
++      if (!response.ok) {
++        failedRequests += 1;
++        console.error(`Ingestion batch at ${offset} failed with HTTP ${response.status}`);
++        continue;
++      }
++
++      const result = await response.json() as { accepted?: number; rejected?: unknown[] };
++      accepted += result.accepted ?? 0;
++      rejected += result.rejected?.length ?? 0;
++    } catch (error) {
++      failedRequests += 1;
++      console.error(`Ingestion batch at ${offset} failed`, error);
++    }
+   }
++}
+ 
+-  const result = (await response.json()) as {
+-    accepted?: number;
+-    rejected?: unknown[];
+-  };
++function sleep(ms: number) {
++  return new Promise<void>((resolve) => setTimeout(resolve, ms));
++}
+ 
+-  accepted += result.accepted ?? 0;
++async function aggregateDuringIngestion() {
++  while (keepAggregating) {
++    const startedAt = performance.now();
+ 
+-  if ((offset + size) % 10_000 === 0) {
+-    console.log(`Inserted ${offset + size}/${TOTAL_LOGS}`);
++    try {
++      const until = new Date();
++      const since = new Date(until.getTime() - monthMs);
++      const response = await fetch(
++        `${url}/logs/aggregate?since=${encodeURIComponent(since.toISOString())}&until=${encodeURIComponent(until.toISOString())}&bucket=1h`,
++      );
++      aggregationLatencies.push(performance.now() - startedAt);
++      aggregationRequests += 1;
++
++      if (!response.ok) {
++        aggregationErrors += 1;
++      }
++    } catch (error) {
++      aggregationLatencies.push(performance.now() - startedAt);
++      aggregationRequests += 1;
++      aggregationErrors += 1;
++      console.error("Aggregation request failed", error);
++    }
++
++    const remaining = 1_000 - (performance.now() - startedAt);
++    await sleep(Math.max(0, remaining));
+   }
+ }
+ 
+-const elapsed = Date.now() - start;
++async function captureStats() {
++  try {
++    const { stdout } = await execFileAsync("docker", [
++      "stats",
++      "--no-stream",
++      "--format",
++      "{{json .}}",
++      "log-ingestion-app",
++      "log-ingestion-postgres",
++    ]);
++
++    for (const line of stdout.trim().split("\n")) {
++      if (!line) {
++        continue;
++      }
+ 
+-console.log("");
+-console.log(`Accepted: ${accepted}`);
+-console.log(`Elapsed: ${elapsed} ms`);
+-console.log(
+-  `Rate: ${Math.round(accepted / (elapsed / 1000))} logs/sec`,
+-);
++      const row = JSON.parse(line) as {
++        Name: string;
++        CPUPerc: string;
++        MemUsage: string;
++      };
++
++      dockerSamples.push({
++        timestamp: new Date().toISOString(),
++        container: row.Name,
++        cpu: row.CPUPerc,
++        memory: row.MemUsage,
++      });
++    }
++  } catch (error) {
++    console.error("Unable to capture Docker resource statistics", error);
++  }
++}
++
++console.log(JSON.stringify({
++  event: "benchmark_started",
++  total_logs: totalLogs,
++  batch_size: batchSize,
++  workers,
++  url,
++  capture_docker_stats: captureDockerStats,
++}));
++
++const startedAt = performance.now();
++const aggregationTask = aggregateDuringIngestion();
++const statsTimer = captureDockerStats
++  ? setInterval(() => void captureStats(), 5_000)
++  : undefined;
++
++if (captureDockerStats) {
++  await captureStats();
++}
++
++await Promise.all(Array.from({ length: workers }, () => ingestWorker()));
++keepAggregating = false;
++await aggregationTask;
++
++if (statsTimer) {
++  clearInterval(statsTimer);
++  await captureStats();
++}
++
++const elapsedMs = performance.now() - startedAt;
++const summary = {
++  event: "benchmark_complete",
++  requested_logs: totalLogs,
++  accepted,
++  rejected,
++  failed_requests: failedRequests,
++  dropped_logs: totalLogs - accepted - rejected,
++  duration_ms: Math.round(elapsedMs),
++  ingestion_logs_per_second: Number((accepted / (elapsedMs / 1_000)).toFixed(2)),
++  ingestion_request_latency: formatLatency(ingestionLatencies),
++  aggregation_requests: aggregationRequests,
++  aggregation_errors: aggregationErrors,
++  aggregation_latency: formatLatency(aggregationLatencies),
++  docker_resource_samples: dockerSamples,
++};
++
++console.log(JSON.stringify(summary, null, 2));
++
++if (failedRequests > 0 || rejected > 0 || accepted !== totalLogs) {
++  process.exitCode = 1;
++}
+diff --git a/src/config/env.ts b/src/config/env.ts
+index ff53830..75fea1c 100644
+--- a/src/config/env.ts
++++ b/src/config/env.ts
+@@ -1,31 +1,58 @@
+-import "dotenv/config";
+-
+-function getNumber(
+-  value: string | undefined,
+-  fallback: number,
+-): number {
+-  if (!value) {
+-    return fallback;
+-  }
+-
+-  const parsed = Number(value);
+-
+-  return Number.isNaN(parsed)
+-    ? fallback
+-    : parsed;
+-}
+-
+-export const env = {
+-  port: getNumber(
+-    process.env.PORT,
+-    8080,
+-  ),
++import "dotenv/config";
++
++function getPositiveInteger(
++  name: string,
++  value: string | undefined,
++  fallback: number,
++  maximum?: number,
++): number {
++  if (value === undefined || value === "") {
++    return fallback;
++  }
++
++  if (!/^\d+$/.test(value)) {
++    throw new Error(`${name} must be a positive integer`);
++  }
++
++  const parsed = Number(value);
++
++  if (
++    !Number.isSafeInteger(parsed) ||
++    parsed < 1 ||
++    (maximum !== undefined && parsed > maximum)
++  ) {
++    throw new Error(`${name} must be a positive integer`);
++  }
++
++  return parsed;
++}
++
++export const env = {
++  port: getPositiveInteger(
++    "PORT",
++    process.env.PORT,
++    8080,
++    65_535,
++  ),
+ 
+   databaseUrl:
+     process.env.DATABASE_URL ?? "",
+ 
+-  retentionDays: getNumber(
+-    process.env.RETENTION_DAYS,
+-    30,
+-  ),
+-};
+\ No newline at end of file
++  retentionDays: getPositiveInteger(
++    "RETENTION_DAYS",
++    process.env.RETENTION_DAYS,
++    30,
++  ),
++
++  retentionBatchSize: getPositiveInteger(
++    "RETENTION_BATCH_SIZE",
++    process.env.RETENTION_BATCH_SIZE,
++    1_000,
++  ),
++
++  retentionMaxBatches: getPositiveInteger(
++    "RETENTION_MAX_BATCHES",
++    process.env.RETENTION_MAX_BATCHES,
++    10,
++  ),
++};
+diff --git a/src/controllers/logs.controller.ts b/src/controllers/logs.controller.ts
+index b026565..8896102 100644
+--- a/src/controllers/logs.controller.ts
++++ b/src/controllers/logs.controller.ts
+@@ -1,304 +1,240 @@
+-import type { FastifyReply, FastifyRequest } from "fastify";
+-import { ingestLogs } from "../services/logs.service.js";
+-import { findLogs ,aggregateLogs } from "../repositories/logs.repository.js";
+-import {
+-  encodeCursor,
+-  decodeCursor,
+-} from "../utils/cursor.js";
+-
+-
+-export async function ingestLogsController(
+-  request: FastifyRequest,
+-  reply: FastifyReply,
+-) {
+-  const result = await ingestLogs(request.body);
+-
+-  if ("error" in result) {
+-    return reply.status(400).send({
+-      error: result.error,
+-    });
+-  }
+-
+-  if (result.allRejected) {
+-    return reply.status(400).send({
+-      accepted: 0,
+-      rejected: result.rejected,
+-    });
+-  }
+-
+-  return reply.status(200).send({
+-    accepted: result.accepted,
+-    rejected: result.rejected,
+-  });
+-}
+-
+-
+-const validLevels = [
+-  "debug",
+-  "info",
+-  "warn",
+-  "error",
+-];
+-
+-function isValidDate(value: string) {
+-  const date = new Date(value);
+-  return !Number.isNaN(date.getTime());
+-}
+-
+-
+-
+-
+-export async function queryLogsController(
+-  request: FastifyRequest,
+-  reply: FastifyReply,
+-) {
+-  const query = request.query as Record<string, string | undefined>;
+-
+-  if (
+-  query.level &&
+-  !validLevels.includes(query.level)
+-) {
+-  return reply.status(400).send({
+-    error: `invalid level: '${query.level}'`,
+-  });
+-}
+-
+-
+-if (
+-  query.since &&
+-  !isValidDate(query.since)
+-) {
+-  return reply.status(400).send({
+-    error: "invalid since timestamp",
+-  });
+-}
+-
+-
+-if (
+-  query.until &&
+-  !isValidDate(query.until)
+-) {
+-  return reply.status(400).send({
+-    error: "invalid until timestamp",
+-  });
+-}
+-
+-
+-if (
+-  query.since &&
+-  query.until &&
+-  new Date(query.until) < new Date(query.since)
+-) {
+-  return reply.status(400).send({
+-    error: "until must be after since",
+-  });
+-}
+-  
+-  
+-  const limit = query.limit
+-    ? Number(query.limit)
+-    : 100;
+-
+-  if (
+-    !Number.isInteger(limit) ||
+-    limit < 1 ||
+-    limit > 1000
+-  ) {
+-    return reply.status(400).send({
+-      error: "invalid limit",
+-    });
+-  }
+-
+-  let cursor;
+-
+-  if (query.cursor) {
+-    const decoded = decodeCursor(query.cursor);
+-
+-    if (!decoded) {
+-      return reply.status(400).send({
+-        error: "invalid cursor",
+-      });
+-    }
+-
+-    cursor = {
+-      timestamp: new Date(decoded.timestamp),
+-      id: decoded.id,
+-    };
+-  }
+-
+-  const attributes: Record<string, string> = {};
+-
+-  for (const [key, value] of Object.entries(query)) {
+-    if (key.startsWith("attr.")) {
+-      attributes[key.slice(5)] = value!;
+-    }
+-  }
+-const rows = await findLogs({
+-  ...(query.service && {
+-    service: query.service,
+-  }),
+-
+-  ...(query.level && {
+-    level: query.level,
+-  }),
+-
+-  ...(query.since && {
+-    since: new Date(query.since),
+-  }),
+-
+-  ...(query.until && {
+-    until: new Date(query.until),
+-  }),
+-
+-  ...(query.q && {
+-    message: query.q,
+-  }),
+-
+-  ...(Object.keys(attributes).length > 0 && {
+-    attributes,
+-  }),
+-
+-  ...(cursor && {
+-    cursor,
+-  }),
+-
+-  limit,
+-});
+-
+-  const hasMore = rows.length > limit;
+-
+-  const logs = hasMore
+-    ? rows.slice(0, limit)
+-    : rows;
+-
+-    const logsResponse = logs.map((log) => ({
+-  id: log.id,
+-  timestamp: log.timestamp.toISOString(),
+-  level: log.level,
+-  service: log.service,
+-  message: log.message,
+-  attributes: log.attributes,
+-}));
+-
+-  const last = logs[logs.length - 1];
+-
+-  return reply.send({
+-  logs: logsResponse,
+-    next_cursor:
+-      hasMore && last
+-        ? encodeCursor({
+-            timestamp:
+-              last.timestamp.toISOString(),
+-            id: last.id,
+-          })
+-        : null,
+-  });
+-}
+-
+-
+-
+-
+-export async function aggregateLogsController(
+-  request: FastifyRequest,
+-  reply: FastifyReply,
+-) {
+-  const query =
+-    request.query as Record<string, string | undefined>;
+-
+-  if (!query.since || !query.until) {
+-    return reply.status(400).send({
+-      error: "since and until are required",
+-    });
+-  }
+-
+-  const since = new Date(query.since);
+-  const until = new Date(query.until);
+-
+-  if (
+-    Number.isNaN(since.getTime()) ||
+-    Number.isNaN(until.getTime())
+-  ) {
+-    return reply.status(400).send({
+-      error: "invalid timestamp",
+-    });
+-  }
+-
+-  if (until <= since) {
+-    return reply.status(400).send({
+-      error: "until must be after since",
+-    });
+-  }
+-
+-
+-  const bucket = query.bucket;
+-
+-  if (
+-    bucket !== "1m" &&
+-    bucket !== "5m" &&
+-    bucket !== "1h" &&
+-    bucket !== "1d"
+-  ) {
+-    return reply.status(400).send({
+-      error: "invalid bucket",
+-    });
+-  }
+-
+-
+-  if (
+-    query.group_by &&
+-    query.group_by !== "service" &&
+-    query.group_by !== "level"
+-  ) {
+-    return reply.status(400).send({
+-      error: "invalid group_by",
+-    });
+-  }
+-
+-
+-  const attributes: Record<string, string> = {};
+-
+-  for (const [key, value] of Object.entries(query)) {
+-    if (key.startsWith("attr.")) {
+-      attributes[key.slice(5)] = value!;
+-    }
+-  }
+-
+-
+-  const result = await aggregateLogs({
+-    since,
+-    until,
+-    bucket,
+-    ...(query.service && {
+-      service: query.service,
+-    }),
+-    ...(query.level && {
+-      level: query.level,
+-    }),
+-    ...(query.q && {
+-      message: query.q,
+-    }),
+-    ...(Object.keys(attributes).length > 0 && {
+-      attributes,
+-    }),
+-    ...(query.group_by && {
+-      groupBy: query.group_by as
+-        | "service"
+-        | "level",
+-    }),
+-  });
+-
+-
+-  return reply.send({
+-    buckets: result.map((row) => ({
+-      start:
+-        new Date(row.start as Date)
+-          .toISOString(),
+-
+-      group:
+-        row.group ?? null,
+-
+-      count:
+-        Number(row.count),
+-    })),
+-  });
+-}
+\ No newline at end of file
++import type { FastifyReply, FastifyRequest } from "fastify";
++import { ingestLogs } from "../services/logs.service.js";
++import { aggregateLogs, findLogs } from "../repositories/logs.repository.js";
++import { decodeCursor, encodeCursor } from "../utils/cursor.js";
++import { parseIsoTimestamp } from "../utils/timestamp.js";
++
++const VALID_LEVELS = ["debug", "info", "warn", "error"] as const;
++
++type QueryParameters = Record<string, string | undefined>;
++
++function getQueryParameters(
++  request: FastifyRequest,
++): QueryParameters | null {
++  const query = request.query as Record<string, unknown>;
++
++  if (Object.values(query).some((value) => value !== undefined && typeof value !== "string")) {
++    return null;
++  }
++
++  return query as QueryParameters;
++}
++
++function getAttributeFilters(
++  query: QueryParameters,
++): Record<string, string> | null {
++  const attributes: Record<string, string> = {};
++
++  for (const [key, value] of Object.entries(query)) {
++    if (!key.startsWith("attr.")) {
++      continue;
++    }
++
++    const attributeKey = key.slice(5);
++
++    if (!attributeKey || value === undefined) {
++      return null;
++    }
++
++    attributes[attributeKey] = value;
++  }
++
++  return attributes;
++}
++
++function invalidQuery(reply: FastifyReply) {
++  return reply.status(400).send({
++    error: "query parameters must be single string values",
++  });
++}
++
++function validateLevel(level: string | undefined, reply: FastifyReply): boolean {
++  if (level && !VALID_LEVELS.includes(level as typeof VALID_LEVELS[number])) {
++    void reply.status(400).send({
++      error: `invalid level: '${level}'`,
++    });
++    return false;
++  }
++
++  return true;
++}
++
++export async function ingestLogsController(
++  request: FastifyRequest,
++  reply: FastifyReply,
++) {
++  const result = await ingestLogs(request.body);
++
++  if ("error" in result) {
++    return reply.status(400).send({
++      error: result.error,
++    });
++  }
++
++  if (result.allRejected) {
++    return reply.status(400).send({
++      accepted: 0,
++      rejected: result.rejected,
++    });
++  }
++
++  return reply.status(200).send({
++    accepted: result.accepted,
++    rejected: result.rejected,
++  });
++}
++
++export async function queryLogsController(
++  request: FastifyRequest,
++  reply: FastifyReply,
++) {
++  const query = getQueryParameters(request);
++
++  if (!query) {
++    return invalidQuery(reply);
++  }
++
++  if (!validateLevel(query.level, reply)) {
++    return reply;
++  }
++
++  const since = query.since ? parseIsoTimestamp(query.since) : undefined;
++  const until = query.until ? parseIsoTimestamp(query.until) : undefined;
++
++  if (query.since && !since) {
++    return reply.status(400).send({ error: "invalid since timestamp" });
++  }
++
++  if (query.until && !until) {
++    return reply.status(400).send({ error: "invalid until timestamp" });
++  }
++
++  if (since && until && until <= since) {
++    return reply.status(400).send({
++      error: "until must be after since",
++    });
++  }
++
++  const limit = query.limit === undefined ? 100 : Number(query.limit);
++
++  if (!Number.isInteger(limit) || limit < 1 || limit > 1_000) {
++    return reply.status(400).send({ error: "invalid limit" });
++  }
++
++  let cursor: { timestamp: Date; id: string } | undefined;
++
++  if (query.cursor) {
++    const decoded = decodeCursor(query.cursor);
++    const timestamp = decoded ? parseIsoTimestamp(decoded.timestamp) : null;
++
++    if (!decoded || !timestamp) {
++      return reply.status(400).send({ error: "invalid cursor" });
++    }
++
++    cursor = { timestamp, id: decoded.id };
++  }
++
++  const attributes = getAttributeFilters(query);
++
++  if (!attributes) {
++    return reply.status(400).send({ error: "invalid attribute filter" });
++  }
++
++  const rows = await findLogs({
++    ...(query.service && { service: query.service }),
++    ...(query.level && { level: query.level }),
++    ...(since && { since }),
++    ...(until && { until }),
++    ...(query.q && { message: query.q }),
++    ...(Object.keys(attributes).length > 0 && { attributes }),
++    ...(cursor && { cursor }),
++    // The repository returns exactly its requested limit.  The controller owns
++    // the one-row look-ahead needed to generate a next cursor.
++    limit: limit + 1,
++  });
++
++  const hasMore = rows.length > limit;
++  const logs = hasMore ? rows.slice(0, limit) : rows;
++  const last = logs.at(-1);
++
++  return reply.send({
++    logs: logs.map((log) => ({
++      id: log.id,
++      timestamp: log.timestamp.toISOString(),
++      level: log.level,
++      service: log.service,
++      message: log.message,
++      attributes: log.attributes,
++    })),
++    next_cursor: hasMore && last
++      ? encodeCursor({ timestamp: last.timestamp.toISOString(), id: last.id })
++      : null,
++  });
++}
++
++export async function aggregateLogsController(
++  request: FastifyRequest,
++  reply: FastifyReply,
++) {
++  const query = getQueryParameters(request);
++
++  if (!query) {
++    return invalidQuery(reply);
++  }
++
++  if (!query.since || !query.until) {
++    return reply.status(400).send({ error: "since and until are required" });
++  }
++
++  if (!validateLevel(query.level, reply)) {
++    return reply;
++  }
++
++  const since = parseIsoTimestamp(query.since);
++  const until = parseIsoTimestamp(query.until);
++
++  if (!since || !until) {
++    return reply.status(400).send({ error: "invalid timestamp" });
++  }
++
++  if (until <= since) {
++    return reply.status(400).send({ error: "until must be after since" });
++  }
++
++  const bucket = query.bucket;
++
++  if (bucket !== "1m" && bucket !== "5m" && bucket !== "1h" && bucket !== "1d") {
++    return reply.status(400).send({ error: "invalid bucket" });
++  }
++
++  if (query.group_by && query.group_by !== "service" && query.group_by !== "level") {
++    return reply.status(400).send({ error: "invalid group_by" });
++  }
++
++  const attributes = getAttributeFilters(query);
++
++  if (!attributes) {
++    return reply.status(400).send({ error: "invalid attribute filter" });
++  }
++
++  const result = await aggregateLogs({
++    since,
++    until,
++    bucket,
++    ...(query.service && { service: query.service }),
++    ...(query.level && { level: query.level }),
++    ...(query.q && { message: query.q }),
++    ...(Object.keys(attributes).length > 0 && { attributes }),
++    ...(query.group_by && {
++      groupBy: query.group_by as "service" | "level",
++    }),
++  });
++
++  return reply.send({
++    buckets: result.map((row) => ({
++      start: new Date(row.start as Date).toISOString(),
++      group: row.group ?? null,
++      count: Number(row.count),
++    })),
++  });
++}
+diff --git a/src/index.ts b/src/index.ts
+index 6c61804..700d482 100644
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -1,21 +1,48 @@
+-import { buildApp } from "./server/app.js";
++import { sql } from "drizzle-orm";
+ import { env } from "./config/env.js";
+-import { startRetentionJob } from "./services/retention.job.js";
++import { db } from "./db/index.js";
++import { buildApp } from "./server/app.js";
++import { startRetentionJob, type RetentionJob } from "./services/retention.job.js";
+ 
+ const app = buildApp();
++let retentionJob: RetentionJob | undefined;
++let shuttingDown = false;
++
++async function shutdown(signal: string) {
++  if (shuttingDown) {
++    return;
++  }
+ 
+-startRetentionJob();
++  shuttingDown = true;
++  app.log.info({ signal }, "shutting down");
++  retentionJob?.stop();
++
++  try {
++    await app.close();
++    process.exit(0);
++  } catch (error) {
++    app.log.error(error, "graceful shutdown failed");
++    process.exit(1);
++  }
++}
++
++process.once("SIGTERM", () => void shutdown("SIGTERM"));
++process.once("SIGINT", () => void shutdown("SIGINT"));
+ 
+ try {
++  // Compose runs migrations before this process starts.  This connection check
++  // prevents the listener from accepting traffic until PostgreSQL is usable.
++  await db.execute(sql`SELECT 1`);
++
+   await app.listen({
+     port: env.port,
+     host: "0.0.0.0",
+   });
+ 
+-  console.log(
+-    `Server listening on port ${env.port}`,
+-  );
++  retentionJob = startRetentionJob();
++  app.log.info(`Server listening on port ${env.port}`);
+ } catch (error) {
+   app.log.error(error);
++  await app.close().catch(() => undefined);
+   process.exit(1);
+-}
+\ No newline at end of file
++}
+diff --git a/src/repositories/logs.repository.ts b/src/repositories/logs.repository.ts
+index 72ecf70..914849e 100644
+--- a/src/repositories/logs.repository.ts
++++ b/src/repositories/logs.repository.ts
+@@ -1,14 +1,18 @@
+ import { db } from "../db/index.js";
+ import { logs } from "../db/schema.js";
+ import type { LogEntry } from "../types/log.types.js";
+-import {
++import {
+   and,
+   desc,
+   eq,
+   gte,
+   lt,
+-  sql,
+-} from "drizzle-orm";
++  sql,
++} from "drizzle-orm";
++
++function escapeLikePattern(value: string): string {
++  return value.replace(/[\\%_]/g, "\\$&");
++}
+ 
+ export async function insertLogs(entries: LogEntry[]) {
+   if (entries.length === 0) {
+@@ -70,18 +74,16 @@ export async function findLogs(query: LogQuery) {
+     );
+   }
+ 
+-  if (query.message) {
+-    conditions.push(
+-      sql`LOWER(${logs.message}) LIKE ${`%${query.message.toLowerCase()}%`}`,
++  if (query.message) {
++    conditions.push(
++      sql`LOWER(${logs.message}) LIKE ${`%${escapeLikePattern(query.message.toLowerCase())}%`} ESCAPE '\\'`,
+     );
+   }
+ 
+   if (query.attributes) {
+     for (const [key, value] of Object.entries(query.attributes)) {
+-      conditions.push(
+-        sql`${logs.attributes} @> ${JSON.stringify({
+-          [key]: value,
+-        })}`,
++      conditions.push(
++        sql`${logs.attributes} ->> ${key} = ${value}`,
+       );
+     }
+   }
+@@ -104,7 +106,7 @@ export async function findLogs(query: LogQuery) {
+       desc(logs.timestamp),
+       desc(logs.id),
+     )
+-    .limit(query.limit + 1);
++    .limit(query.limit);
+ }
+ 
+ 
+@@ -140,31 +142,28 @@ export async function aggregateLogs(
+     );
+   }
+ 
+-  if (query.message) {
+-    conditions.push(
+-      sql`LOWER(${logs.message}) LIKE ${`%${query.message.toLowerCase()}%`}`,
++  if (query.message) {
++    conditions.push(
++      sql`LOWER(${logs.message}) LIKE ${`%${escapeLikePattern(query.message.toLowerCase())}%`} ESCAPE '\\'`,
+     );
+   }
+ 
+   if (query.attributes) {
+     for (const [key, value] of Object.entries(query.attributes)) {
+-      conditions.push(
+-        sql`${logs.attributes} @> ${JSON.stringify({
+-          [key]: value,
+-        })}`,
++      conditions.push(
++        sql`${logs.attributes} ->> ${key} = ${value}`,
+       );
+     }
+   }
+ 
+   const bucketExpression =
+     query.bucket === "1m"
+-      ? sql`date_trunc('minute', ${logs.timestamp})`
++      ? sql`date_bin('1 minute', ${logs.timestamp}, TIMESTAMPTZ '2000-01-01 00:00:00+00')`
+       : query.bucket === "5m"
+-        ? sql`date_trunc('minute', ${logs.timestamp}) - 
+-          ((extract(minute from ${logs.timestamp})::int % 5) * interval '1 minute')`
++        ? sql`date_bin('5 minutes', ${logs.timestamp}, TIMESTAMPTZ '2000-01-01 00:00:00+00')`
+         : query.bucket === "1h"
+-          ? sql`date_trunc('hour', ${logs.timestamp})`
+-          : sql`date_trunc('day', ${logs.timestamp})`;
++          ? sql`date_bin('1 hour', ${logs.timestamp}, TIMESTAMPTZ '2000-01-01 00:00:00+00')`
++          : sql`date_bin('1 day', ${logs.timestamp}, TIMESTAMPTZ '2000-01-01 00:00:00+00')`;
+ 
+ 
+   const groupExpression =
+@@ -198,4 +197,4 @@ if (query.groupBy) {
+ return queryBuilder
+   .groupBy(bucketExpression)
+   .orderBy(bucketExpression);
+-}
+\ No newline at end of file
++}
+diff --git a/src/server/app.ts b/src/server/app.ts
+index c45e959..43b1d24 100644
+--- a/src/server/app.ts
++++ b/src/server/app.ts
+@@ -1,12 +1,42 @@
+-import Fastify from "fastify";
+-import { registerRoutes } from "./routes.js";
++import Fastify from "fastify";
++import { registerRoutes } from "./routes.js";
++import { pool } from "../db/index.js";
+ 
+ export function buildApp() {
+-  const app = Fastify({
+-    logger: true,
+-  });
++  const app = Fastify({
++    logger: true,
++    bodyLimit: 1_048_576,
++  });
++
++  app.setErrorHandler((error, request, reply) => {
++    const fastifyError = error as {
++      code?: string;
++      message: string;
++      statusCode?: number;
++    };
++
++    if (fastifyError.code === "FST_ERR_CTP_INVALID_JSON_BODY") {
++      return reply.status(400).send({ error: "malformed JSON body" });
++    }
++
++    request.log.error(error);
++
++    return reply.status(
++      fastifyError.statusCode && fastifyError.statusCode < 500
++        ? fastifyError.statusCode
++        : 500,
++    ).send({
++      error: fastifyError.statusCode && fastifyError.statusCode < 500
++        ? fastifyError.message
++        : "internal server error",
++    });
++  });
++
++  app.addHook("onClose", async () => {
++    await pool.end();
++  });
+ 
+   app.register(registerRoutes);
+ 
+   return app;
+-}
+\ No newline at end of file
++}
+diff --git a/src/services/retention.job.ts b/src/services/retention.job.ts
+index e4a33f9..4a12019 100644
+--- a/src/services/retention.job.ts
++++ b/src/services/retention.job.ts
+@@ -1,24 +1,41 @@
+-import { deleteExpiredLogs } from "./retention.service.js";
+-
+-
+-export function startRetentionJob() {
+-  const interval =
+-    1000 * 60 * 60; // every hour
+-
+-
+-  setInterval(async () => {
+-    try {
+-      await deleteExpiredLogs();
+-    } catch (error) {
+-      console.error(
+-        "Retention job failed",
+-        error,
+-      );
+-    }
+-  }, interval);
+-
+-
+-  console.log(
+-    "Retention job started",
+-  );
+-}
+\ No newline at end of file
++import { deleteExpiredLogs } from "./retention.service.js";
++
++const RETENTION_INTERVAL_MS = 60 * 60 * 1_000;
++
++export interface RetentionJob {
++  stop: () => void;
++}
++
++export function startRetentionJob(): RetentionJob {
++  let running = false;
++
++  const run = async () => {
++    if (running) {
++      console.warn("Retention cleanup skipped because the previous run is still active");
++      return;
++    }
++
++    running = true;
++
++    try {
++      const result = await deleteExpiredLogs();
++      console.log(
++        `Retention cleanup deleted ${result.deleted} logs in ${result.batches} batch(es)${result.capped ? "; batch cap reached" : ""}`,
++      );
++    } catch (error) {
++      console.error("Retention job failed", error);
++    } finally {
++      running = false;
++    }
++  };
++
++  // Start only after the HTTP server is ready (the caller invokes us after
++  // listen) and keep future runs from holding the process open on shutdown.
++  void run();
++  const timer = setInterval(() => void run(), RETENTION_INTERVAL_MS);
++  timer.unref();
++
++  return {
++    stop: () => clearInterval(timer),
++  };
++}
+diff --git a/src/services/retention.service.ts b/src/services/retention.service.ts
+index 90b18f4..e4e19ee 100644
+--- a/src/services/retention.service.ts
++++ b/src/services/retention.service.ts
+@@ -1,33 +1,56 @@
+-import { db } from "../db/index.js";
+-import { logs } from "../db/schema.js";
+-import { lt } from "drizzle-orm";
+-import { env } from "../config/env.js";
+-
+-
+-export async function deleteExpiredLogs() {
+-  const cutoff = new Date();
+-
+-  cutoff.setDate(
+-    cutoff.getDate() - env.retentionDays,
+-  );
+-
+-  const result = await db
+-    .delete(logs)
+-    .where(
+-      lt(
+-        logs.timestamp,
+-        cutoff,
+-      ),
+-    )
+-    .returning({
+-      id: logs.id,
+-    });
+-
+-
+-  console.log(
+-    `Retention cleanup deleted ${result.length} logs older than ${cutoff.toISOString()}`,
+-  );
+-
+-
+-  return result.length;
+-}
+\ No newline at end of file
++import { env } from "../config/env.js";
++import { deleteExpiredLogsBatch } from "../repositories/retention.repository.js";
++
++export interface RetentionResult {
++  deleted: number;
++  batches: number;
++  capped: boolean;
++}
++
++export interface RetentionOptions {
++  cutoff?: Date;
++  batchSize?: number;
++  maxBatches?: number;
++  deleteBatch?: (cutoff: Date, batchSize: number) => Promise<number>;
++}
++
++export function retentionCutoff(now = new Date()): Date {
++  return new Date(now.getTime() - env.retentionDays * 24 * 60 * 60 * 1_000);
++}
++
++/**
++ * Runs a bounded sequence of small transactions.  Bounded batches reduce
++ * lock duration and avoid materializing every deleted row in application RAM.
++ */
++export async function deleteExpiredLogs(
++  options: RetentionOptions = {},
++): Promise<RetentionResult> {
++  const cutoff = options.cutoff ?? retentionCutoff();
++  const batchSize = options.batchSize ?? env.retentionBatchSize;
++  const maxBatches = options.maxBatches ?? env.retentionMaxBatches;
++  const deleteBatch = options.deleteBatch ?? deleteExpiredLogsBatch;
++
++  let deleted = 0;
++  let batches = 0;
++
++  while (batches < maxBatches) {
++    const deletedInBatch = await deleteBatch(cutoff, batchSize);
++
++    if (deletedInBatch === 0) {
++      break;
++    }
++
++    deleted += deletedInBatch;
++    batches += 1;
++
++    if (deletedInBatch < batchSize) {
++      break;
++    }
++  }
++
++  return {
++    deleted,
++    batches,
++    capped: batches === maxBatches,
++  };
++}
+diff --git a/src/utils/cursor.ts b/src/utils/cursor.ts
+index fd76bfc..6ce1e27 100644
+--- a/src/utils/cursor.ts
++++ b/src/utils/cursor.ts
+@@ -1,7 +1,11 @@
+-interface CursorData {
+-  timestamp: string;
+-  id: string;
+-}
++import { parseIsoTimestamp } from "./timestamp.js";
++
++interface CursorData {
++  timestamp: string;
++  id: string;
++}
++
++const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+ 
+ export function encodeCursor(data: CursorData): string {
+   return Buffer.from(JSON.stringify(data)).toString("base64url");
+@@ -18,10 +22,12 @@ export function decodeCursor(
+ 
+     const parsed = JSON.parse(decoded);
+ 
+-    if (
+-      typeof parsed.timestamp !== "string" ||
+-      typeof parsed.id !== "string"
+-    ) {
++    if (
++      typeof parsed.timestamp !== "string" ||
++      typeof parsed.id !== "string" ||
++      !parseIsoTimestamp(parsed.timestamp) ||
++      !UUID_PATTERN.test(parsed.id)
++    ) {
+       return null;
+     }
+ 
+@@ -29,4 +35,4 @@ export function decodeCursor(
+   } catch {
+     return null;
+   }
+-}
+\ No newline at end of file
++}
+diff --git a/src/validators/log.validator.ts b/src/validators/log.validator.ts
+index ff71b8b..528f724 100644
+--- a/src/validators/log.validator.ts
++++ b/src/validators/log.validator.ts
+@@ -1,8 +1,9 @@
+-import {
+-  LOG_LEVELS,
+-  type LogAttributes,
+-  type LogEntry,
+-} from "../types/log.types.js";
++import {
++  LOG_LEVELS,
++  type LogAttributes,
++  type LogEntry,
++} from "../types/log.types.js";
++import { parseIsoTimestamp } from "../utils/timestamp.js";
+ 
+ const MAX_FUTURE_MS = 5 * 60 * 1000;
+ 
+@@ -59,16 +60,16 @@ export function validateLogEntry(
+     };
+   }
+ 
+-  const timestampMs = Date.parse(timestamp);
+-
+-  if (Number.isNaN(timestampMs)) {
+-    return {
+-      valid: false,
+-      reason: "invalid timestamp",
+-    };
+-  }
+-
+-  if (timestampMs > Date.now() + MAX_FUTURE_MS) {
++  const parsedTimestamp = parseIsoTimestamp(timestamp);
++
++  if (!parsedTimestamp) {
++    return {
++      valid: false,
++      reason: "invalid timestamp",
++    };
++  }
++
++  if (parsedTimestamp.getTime() > Date.now() + MAX_FUTURE_MS) {
+     return {
+       valid: false,
+       reason: "timestamp cannot be more than five minutes in the future",
+@@ -128,4 +129,4 @@ export function validateLogEntry(
+       attributes: attributes ?? {},
+     },
+   };
+-}
+\ No newline at end of file
++}
+diff --git a/tests/log.validator.test.ts b/tests/log.validator.test.ts
+index 0c6f07b..453a2ff 100644
+--- a/tests/log.validator.test.ts
++++ b/tests/log.validator.test.ts
+@@ -32,7 +32,7 @@ describe("validateLogEntry", () => {
+     });
+   });
+ 
+-  it("rejects an invalid timestamp", () => {
++  it("rejects an invalid timestamp", () => {
+     const result = validateLogEntry({
+       timestamp: "not-a-date",
+       level: "error",
+@@ -44,7 +44,35 @@ describe("validateLogEntry", () => {
+       valid: false,
+       reason: "invalid timestamp",
+     });
+-  });
++  });
++
++  it("rejects a parseable but non-ISO timestamp", () => {
++    const result = validateLogEntry({
++      timestamp: "August 9, 2026 20:00:00 UTC",
++      level: "info",
++      service: "auth",
++      message: "test",
++    });
++
++    expect(result).toEqual({
++      valid: false,
++      reason: "invalid timestamp",
++    });
++  });
++
++  it("rejects timestamps more than five minutes in the future", () => {
++    const result = validateLogEntry({
++      timestamp: new Date(Date.now() + 5 * 60 * 1_000 + 1).toISOString(),
++      level: "info",
++      service: "auth",
++      message: "test",
++    });
++
++    expect(result).toEqual({
++      valid: false,
++      reason: "timestamp cannot be more than five minutes in the future",
++    });
++  });
+ 
+   it("rejects an invalid level", () => {
+     const result = validateLogEntry({
+@@ -88,7 +116,7 @@ describe("validateLogEntry", () => {
+     });
+   });
+ 
+-  it("rejects nested attributes", () => {
++  it("rejects nested attributes", () => {
+     const result = validateLogEntry({
+       timestamp: "2026-08-09T20:00:00.000Z",
+       level: "info",
+@@ -106,7 +134,21 @@ describe("validateLogEntry", () => {
+       reason:
+         "attributes must be a flat object with string, number, or boolean values",
+     });
+-  });
++  });
++
++  it("rejects attribute arrays", () => {
++    const result = validateLogEntry({
++      timestamp: "2026-08-09T20:00:00.000Z",
++      level: "info",
++      service: "auth",
++      message: "test",
++      attributes: {
++        ids: ["42"],
++      },
++    });
++
++    expect(result.valid).toBe(false);
++  });
+ 
+   it("rejects non-finite numeric attributes", () => {
+     const result = validateLogEntry({
+@@ -125,4 +167,4 @@ describe("validateLogEntry", () => {
+         "attributes must be a flat object with string, number, or boolean values",
+     });
+   });
+-});
+\ No newline at end of file
++});
+diff --git a/tests/logs.repository.test.ts b/tests/logs.repository.test.ts
+index f619e65..889877a 100644
+--- a/tests/logs.repository.test.ts
++++ b/tests/logs.repository.test.ts
+@@ -170,12 +170,12 @@ describe("findLogs", () => {
+     expect(result[0]?.message).toBe("login successful");
+   });
+ 
+-  it("respects the limit", async () => {
++  it("returns exactly the requested limit", async () => {
+     const result = await findLogs({
+       limit: 2,
+     });
+ 
+-    expect(result).toHaveLength(3);
++    expect(result).toHaveLength(2);
+   });
+ });
+ 
+@@ -257,4 +257,4 @@ describe("aggregateLogs", () => {
+     expect(result).toHaveLength(1);
+     expect(Number(result[0]?.count)).toBe(2);
+   });
+-});
+\ No newline at end of file
++});

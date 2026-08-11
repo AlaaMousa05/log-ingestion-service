@@ -23,6 +23,10 @@ COPY --from=builder /app/dist ./dist
 COPY --from=builder /app/drizzle.config.ts ./drizzle.config.ts
 COPY --from=builder /app/src/db/migrations ./src/db/migrations
 
+RUN chown -R node:node /app
+
+USER node
+
 EXPOSE 8080
 
 CMD ["node", "dist/index.js"]

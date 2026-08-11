@@ -32,6 +32,12 @@ export const logs = pgTable(
       .notNull()
       .default({}),
 
+ 
+    attributesText: jsonb("attributes_text")
+      .$type<Record<string, string>>()
+      .notNull()
+      .default({}),
+
     createdAt: timestamp("created_at", {
       withTimezone: true,
     })
@@ -39,19 +45,21 @@ export const logs = pgTable(
       .notNull(),
   },
  (table) => ({
-  timestampIndex: index("logs_timestamp_idx")
-    .on(table.timestamp),
-
-  serviceIndex: index("logs_service_idx")
-    .on(table.service),
-
-  levelIndex: index("logs_level_idx")
-    .on(table.level),
-
   cursorIndex: index("logs_cursor_idx")
     .on(table.timestamp, table.id),
 
-    messageSearchIndex: index("logs_message_search_idx")
+
+  serviceTimestampIdIndex: index("logs_service_timestamp_id_idx")
+    .on(table.service, sql`${table.timestamp} DESC`, sql`${table.id} DESC`),
+
+  levelTimestampIdIndex: index("logs_level_timestamp_id_idx")
+    .on(table.level, sql`${table.timestamp} DESC`, sql`${table.id} DESC`),
+
+  messageSearchIndex: index("logs_message_search_idx")
   .using("gin", sql`LOWER(${table.message}) gin_trgm_ops`),
+
+
+  attributesTextIndex: index("logs_attributes_text_gin_idx")
+    .using("gin", sql`${table.attributesText} jsonb_path_ops`),
 }),
 );

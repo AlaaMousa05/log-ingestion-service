@@ -1,4 +1,4 @@
-import { db } from "../db/index.js";
+import { db, pool } from "../db/index.js";
 import { logs } from "../db/schema.js";
 import type { LogEntry } from "../types/log.types.js";
 import {
@@ -9,21 +9,72 @@ import {
   lt,
   sql,
 } from "drizzle-orm";
+import { from as copyFrom } from "pg-copy-streams";
+import { Readable } from "node:stream";
+import { pipeline } from "node:stream/promises";
 
+function escapeLikePattern(value: string): string {
+  return value.replace(/[\\%_]/g, "\\$&");
+}
+
+
+function toAttributesText(
+  attributes: Record<string, string | number | boolean>,
+): Record<string, string> {
+  const text: Record<string, string> = {};
+
+  for (const [key, value] of Object.entries(attributes)) {
+    text[key] = String(value);
+  }
+
+  return text;
+}
+
+
+function csvField(value: string): string {
+  return `"${value.replace(/"/g, '""')}"`;
+}
+
+function toCsvRow(entry: LogEntry): string {
+  const attrs = entry.attributes ?? {};
+  
+  const attrsText: Record<string, string> = {};
+  for (const k in attrs) {
+    attrsText[k] = String(attrs[k]);
+  }
+
+  const strAttrs = JSON.stringify(attrs);
+  const strAttrsText = JSON.stringify(attrsText);
+
+  return `${entry.timestamp},${csvField(entry.level)},${csvField(entry.service)},${csvField(entry.message)},${csvField(strAttrs)},${csvField(strAttrsText)}\n`;
+}
 export async function insertLogs(entries: LogEntry[]) {
   if (entries.length === 0) {
     return 0;
   }
 
-  const values = entries.map((entry) => ({
-    timestamp: new Date(entry.timestamp),
-    level: entry.level,
-    service: entry.service,
-    message: entry.message,
-    attributes: entry.attributes ?? {},
-  }));
+  const client = await pool.connect();
 
-  await db.insert(logs).values(values);
+  try {
+    const copyStream = client.query(
+      copyFrom(
+        `COPY logs (timestamp, level, service, message, attributes, attributes_text)
+         FROM STDIN WITH (FORMAT csv)`,
+      ),
+    );
+
+    const source = Readable.from(
+      (function* () {
+        for (const entry of entries) {
+          yield toCsvRow(entry);
+        }
+      })(),
+    );
+
+    await pipeline(source, copyStream);
+  } finally {
+    client.release();
+  }
 
   return entries.length;
 }
@@ -72,18 +123,15 @@ export async function findLogs(query: LogQuery) {
 
   if (query.message) {
     conditions.push(
-      sql`LOWER(${logs.message}) LIKE ${`%${query.message.toLowerCase()}%`}`,
+      sql`LOWER(${logs.message}) LIKE ${`%${escapeLikePattern(query.message.toLowerCase())}%`} ESCAPE '\\'`,
     );
   }
 
-  if (query.attributes) {
-    for (const [key, value] of Object.entries(query.attributes)) {
-      conditions.push(
-        sql`${logs.attributes} @> ${JSON.stringify({
-          [key]: value,
-        })}`,
-      );
-    }
+  if (query.attributes && Object.keys(query.attributes).length > 0) {
+
+    conditions.push(
+      sql`${logs.attributesText} @> ${JSON.stringify(query.attributes)}::jsonb`,
+    );
   }
 
   if (query.cursor) {
@@ -104,7 +152,7 @@ export async function findLogs(query: LogQuery) {
       desc(logs.timestamp),
       desc(logs.id),
     )
-    .limit(query.limit + 1);
+    .limit(query.limit);
 }
 
 
@@ -120,52 +168,40 @@ export interface AggregateQuery {
 }
 
 
-export async function aggregateLogs(
-  query: AggregateQuery,
-) {
+export async function aggregateLogs(query: AggregateQuery) {
   const conditions = [
     gte(logs.timestamp, query.since),
     lt(logs.timestamp, query.until),
   ];
 
   if (query.service) {
-    conditions.push(
-      eq(logs.service, query.service),
-    );
+    conditions.push(eq(logs.service, query.service));
   }
 
   if (query.level) {
-    conditions.push(
-      eq(logs.level, query.level),
-    );
+    conditions.push(eq(logs.level, query.level));
   }
 
   if (query.message) {
     conditions.push(
-      sql`LOWER(${logs.message}) LIKE ${`%${query.message.toLowerCase()}%`}`,
+      sql`LOWER(${logs.message}) LIKE ${`%${escapeLikePattern(query.message.toLowerCase())}%`} ESCAPE '\\'`
     );
   }
 
-  if (query.attributes) {
-    for (const [key, value] of Object.entries(query.attributes)) {
-      conditions.push(
-        sql`${logs.attributes} @> ${JSON.stringify({
-          [key]: value,
-        })}`,
-      );
-    }
+  if (query.attributes && Object.keys(query.attributes).length > 0) {
+    conditions.push(
+      sql`${logs.attributesText} @> ${JSON.stringify(query.attributes)}::jsonb`
+    );
   }
 
   const bucketExpression =
     query.bucket === "1m"
-      ? sql`date_trunc('minute', ${logs.timestamp})`
+      ? sql`date_bin('1 minute', ${logs.timestamp}, TIMESTAMPTZ '2026-01-01 00:00:00+00')`
       : query.bucket === "5m"
-        ? sql`date_trunc('minute', ${logs.timestamp}) - 
-          ((extract(minute from ${logs.timestamp})::int % 5) * interval '1 minute')`
+        ? sql`date_bin('5 minutes', ${logs.timestamp}, TIMESTAMPTZ '2026-01-01 00:00:00+00')`
         : query.bucket === "1h"
-          ? sql`date_trunc('hour', ${logs.timestamp})`
-          : sql`date_trunc('day', ${logs.timestamp})`;
-
+          ? sql`date_bin('1 hour', ${logs.timestamp}, TIMESTAMPTZ '2026-01-01 00:00:00+00')`
+          : sql`date_bin('1 day', ${logs.timestamp}, TIMESTAMPTZ '2026-01-01 00:00:00+00')`;
 
   const groupExpression =
     query.groupBy === "service"
@@ -174,28 +210,22 @@ export async function aggregateLogs(
         ? logs.level
         : sql`NULL`;
 
-
   const queryBuilder = db
-  .select({
-    start: bucketExpression,
-    group: groupExpression,
-    count: sql<number>`count(*)`,
-  })
-  .from(logs)
-  .where(and(...conditions));
+    .select({
+      start: bucketExpression,
+      group: groupExpression,
+      count: sql<number>`cast(count(*) as integer)`, 
+    })
+    .from(logs)
+    .where(and(...conditions));
 
+  if (query.groupBy) {
+    return queryBuilder
+      .groupBy(bucketExpression, groupExpression)
+      .orderBy(bucketExpression);
+  }
 
-if (query.groupBy) {
   return queryBuilder
-    .groupBy(
-      bucketExpression,
-      groupExpression,
-    )
+    .groupBy(bucketExpression)
     .orderBy(bucketExpression);
-}
-
-
-return queryBuilder
-  .groupBy(bucketExpression)
-  .orderBy(bucketExpression);
 }

@@ -170,12 +170,12 @@ describe("findLogs", () => {
     expect(result[0]?.message).toBe("login successful");
   });
 
-  it("respects the limit", async () => {
+  it("returns exactly the requested limit", async () => {
     const result = await findLogs({
       limit: 2,
     });
 
-    expect(result).toHaveLength(3);
+    expect(result).toHaveLength(2);
   });
 });
 

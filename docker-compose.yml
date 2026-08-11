@@ -1,13 +1,24 @@
 services:
   postgres:
-    image: postgres:18
+    image: postgres:18.4
     container_name: log-ingestion-postgres
+    restart: unless-stopped
+    command: >
+      postgres
+      -c synchronous_commit=off
+      -c fsync=off
+      -c full_page_writes=off
+      -c max_wal_size=4GB
+      -c checkpoint_timeout=15min
+      -c shared_buffers=384MB
+      -c work_mem=32MB
+      -c maintenance_work_mem=128MB
+      -c effective_cache_size=768MB
+      -c random_page_cost=1.1
     environment:
       POSTGRES_DB: log_ingestion
       POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
-    ports:
-      - "5432:5432"
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
     volumes:
       - postgres_data:/var/lib/postgresql
     healthcheck:
@@ -15,14 +26,20 @@ services:
       interval: 5s
       timeout: 5s
       retries: 10
+      start_period: 10s
+    cpus: "1.0"
+    mem_limit: 1g
 
   app:
     build: .
     container_name: log-ingestion-app
+    restart: unless-stopped
     environment:
-      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/log_ingestion
+      DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD:-postgres}@postgres:5432/log_ingestion
       PORT: 8080
-      RETENTION_DAYS: 30
+      RETENTION_DAYS: ${RETENTION_DAYS:-30}
+      RETENTION_BATCH_SIZE: ${RETENTION_BATCH_SIZE:-1000}
+      RETENTION_MAX_BATCHES: ${RETENTION_MAX_BATCHES:-10}
     ports:
       - "8080:8080"
     depends_on:
@@ -30,18 +47,27 @@ services:
         condition: service_healthy
     command: >
       sh -c "npx drizzle-kit migrate && node dist/index.js"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1:8080/health > /dev/null || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 15s
+    cpus: "0.5"
+    mem_limit: 256m
 
   test:
+    profiles: ["test"]
     image: node:22-alpine
     working_dir: /app
     volumes:
       - .:/app
     environment:
-      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/log_ingestion
+      DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD:-postgres}@postgres:5432/log_ingestion
     depends_on:
       postgres:
         condition: service_healthy
-    command: sh -c "npm ci && npx vitest run"
+    command: sh -c "npm ci && npx drizzle-kit migrate && npx vitest run"
 
 volumes:
   postgres_data:
