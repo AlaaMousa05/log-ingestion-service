@@ -1,10 +1,11 @@
 import Fastify from "fastify";
 import { registerRoutes } from "./routes.js";
 import { pool } from "../db/index.js";
+import { env } from "../config/env.js";
 
 export function buildApp() {
   const app = Fastify({
-    logger: true,
+    logger: { level: env.logLevel },
     bodyLimit: 1_048_576,
   });
 

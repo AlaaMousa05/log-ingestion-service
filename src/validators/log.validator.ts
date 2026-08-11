@@ -69,7 +69,7 @@ export function validateLogEntry(
     };
   }
 
-  if (parsedTimestamp.getTime() > Date.now() + MAX_FUTURE_MS) {
+  if (parsedTimestamp.getTime() >= Date.now() + MAX_FUTURE_MS) {
     return {
       valid: false,
       reason: "timestamp cannot be more than five minutes in the future",

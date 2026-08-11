@@ -1,6 +1,6 @@
 import { db, pool } from "../db/index.js";
 import { logs } from "../db/schema.js";
-import type { LogEntry } from "../types/log.types.js";
+import type { LogEntry, LogQuery, AggregateQuery } from "../types/log.types.js";
 import {
   and,
   desc,
@@ -17,37 +17,50 @@ function escapeLikePattern(value: string): string {
   return value.replace(/[\\%_]/g, "\\$&");
 }
 
-
 function toAttributesText(
   attributes: Record<string, string | number | boolean>,
 ): Record<string, string> {
   const text: Record<string, string> = {};
 
-  for (const [key, value] of Object.entries(attributes)) {
-    text[key] = String(value);
+  for (const key in attributes) {
+    text[key] = String(attributes[key]);
   }
 
   return text;
 }
 
-
-function csvField(value: string): string {
-  return `"${value.replace(/"/g, '""')}"`;
+function copyTextField(value: string): string {
+  return value.replace(/[\\\t\n\r]/g, (character) => {
+    switch (character) {
+      case "\\":
+        return "\\\\";
+      case "\t":
+        return "\\t";
+      case "\n":
+        return "\\n";
+      case "\r":
+        return "\\r";
+      default:
+        return character;
+    }
+  });
 }
 
-function toCsvRow(entry: LogEntry): string {
+function toCopyTextRow(entry: LogEntry): string {
   const attrs = entry.attributes ?? {};
-  
-  const attrsText: Record<string, string> = {};
-  for (const k in attrs) {
-    attrsText[k] = String(attrs[k]);
-  }
-
   const strAttrs = JSON.stringify(attrs);
-  const strAttrsText = JSON.stringify(attrsText);
+  const strAttrsText = JSON.stringify(toAttributesText(attrs));
 
-  return `${entry.timestamp},${csvField(entry.level)},${csvField(entry.service)},${csvField(entry.message)},${csvField(strAttrs)},${csvField(strAttrsText)}\n`;
+  return [
+    entry.timestamp,
+    entry.level,
+    entry.service,
+    entry.message,
+    strAttrs,
+    strAttrsText,
+  ].map(copyTextField).join("\t") + "\n";
 }
+
 export async function insertLogs(entries: LogEntry[]) {
   if (entries.length === 0) {
     return 0;
@@ -59,14 +72,20 @@ export async function insertLogs(entries: LogEntry[]) {
     const copyStream = client.query(
       copyFrom(
         `COPY logs (timestamp, level, service, message, attributes, attributes_text)
-         FROM STDIN WITH (FORMAT csv)`,
+         FROM STDIN WITH (FORMAT text)`,
       ),
     );
 
+    const CHUNK_SIZE = 500;
     const source = Readable.from(
       (function* () {
-        for (const entry of entries) {
-          yield toCsvRow(entry);
+        for (let i = 0; i < entries.length; i += CHUNK_SIZE) {
+          const chunk = entries.slice(i, i + CHUNK_SIZE);
+          let buffer = "";
+          for (const entry of chunk) {
+            buffer += toCopyTextRow(entry);
+          }
+          yield buffer;
         }
       })(),
     );
@@ -79,46 +98,23 @@ export async function insertLogs(entries: LogEntry[]) {
   return entries.length;
 }
 
-
-export interface LogQuery {
-  service?: string;
-  level?: string;
-  since?: Date;
-  until?: Date;
-  message?: string;
-  attributes?: Record<string, string>;
-  limit: number;
-  cursor?: {
-    timestamp: Date;
-    id: string;
-  };
-}
-
 export async function findLogs(query: LogQuery) {
   const conditions = [];
 
   if (query.service) {
-    conditions.push(
-      eq(logs.service, query.service),
-    );
+    conditions.push(eq(logs.service, query.service));
   }
 
   if (query.level) {
-    conditions.push(
-      eq(logs.level, query.level),
-    );
+    conditions.push(eq(logs.level, query.level));
   }
 
   if (query.since) {
-    conditions.push(
-      gte(logs.timestamp, query.since),
-    );
+    conditions.push(gte(logs.timestamp, query.since));
   }
 
   if (query.until) {
-    conditions.push(
-      lt(logs.timestamp, query.until),
-    );
+    conditions.push(lt(logs.timestamp, query.until));
   }
 
   if (query.message) {
@@ -128,7 +124,6 @@ export async function findLogs(query: LogQuery) {
   }
 
   if (query.attributes && Object.keys(query.attributes).length > 0) {
-
     conditions.push(
       sql`${logs.attributesText} @> ${JSON.stringify(query.attributes)}::jsonb`,
     );
@@ -136,37 +131,17 @@ export async function findLogs(query: LogQuery) {
 
   if (query.cursor) {
     conditions.push(
-      sql`(${logs.timestamp}, ${logs.id}) < (${query.cursor.timestamp}, ${query.cursor.id})`,
+      sql`(${logs.timestamp}, ${logs.id}) < (${query.cursor.timestamp}, ${query.cursor.id}::bigint)`,
     );
   }
 
   return db
     .select()
     .from(logs)
-    .where(
-      conditions.length > 0
-        ? and(...conditions)
-        : undefined,
-    )
-    .orderBy(
-      desc(logs.timestamp),
-      desc(logs.id),
-    )
+    .where(conditions.length > 0 ? and(...conditions) : undefined)
+    .orderBy(desc(logs.timestamp), desc(logs.id))
     .limit(query.limit);
 }
-
-
-export interface AggregateQuery {
-  since: Date;
-  until: Date;
-  bucket: "1m" | "5m" | "1h" | "1d";
-  groupBy?: "service" | "level";
-  service?: string;
-  level?: string;
-  message?: string;
-  attributes?: Record<string, string>;
-}
-
 
 export async function aggregateLogs(query: AggregateQuery) {
   const conditions = [
@@ -184,13 +159,13 @@ export async function aggregateLogs(query: AggregateQuery) {
 
   if (query.message) {
     conditions.push(
-      sql`LOWER(${logs.message}) LIKE ${`%${escapeLikePattern(query.message.toLowerCase())}%`} ESCAPE '\\'`
+      sql`LOWER(${logs.message}) LIKE ${`%${escapeLikePattern(query.message.toLowerCase())}%`} ESCAPE '\\'`,
     );
   }
 
   if (query.attributes && Object.keys(query.attributes).length > 0) {
     conditions.push(
-      sql`${logs.attributesText} @> ${JSON.stringify(query.attributes)}::jsonb`
+      sql`${logs.attributesText} @> ${JSON.stringify(query.attributes)}::jsonb`,
     );
   }
 
@@ -214,7 +189,7 @@ export async function aggregateLogs(query: AggregateQuery) {
     .select({
       start: bucketExpression,
       group: groupExpression,
-      count: sql<number>`cast(count(*) as integer)`, 
+      count: sql<number>`cast(count(*) as integer)`,
     })
     .from(logs)
     .where(and(...conditions));

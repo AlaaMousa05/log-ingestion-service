@@ -37,16 +37,16 @@ services:
     environment:
       DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD:-postgres}@postgres:5432/log_ingestion
       PORT: 8080
+      LOG_LEVEL: ${LOG_LEVEL:-warn}
       RETENTION_DAYS: ${RETENTION_DAYS:-30}
-      RETENTION_BATCH_SIZE: ${RETENTION_BATCH_SIZE:-1000}
+      RETENTION_BATCH_SIZE: ${RETENTION_BATCH_SIZE:-2500}
       RETENTION_MAX_BATCHES: ${RETENTION_MAX_BATCHES:-10}
     ports:
       - "8080:8080"
     depends_on:
       postgres:
         condition: service_healthy
-    command: >
-      sh -c "npx drizzle-kit migrate && node dist/index.js"
+    command: npm start
     healthcheck:
       test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1:8080/health > /dev/null || exit 1"]
       interval: 10s

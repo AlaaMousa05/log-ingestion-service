@@ -1,5 +1,8 @@
 import "dotenv/config";
 
+const LOG_LEVELS = ["fatal", "error", "warn", "info", "debug", "trace", "silent"] as const;
+type LogLevel = (typeof LOG_LEVELS)[number];
+
 function getPositiveInteger(
   name: string,
   value: string | undefined,
@@ -27,7 +30,21 @@ function getPositiveInteger(
   return parsed;
 }
 
+function getLogLevel(value: string | undefined): LogLevel {
+  if (value === undefined || value === "") {
+    return "warn";
+  }
+
+  if (!LOG_LEVELS.includes(value as LogLevel)) {
+    throw new Error(`LOG_LEVEL must be one of: ${LOG_LEVELS.join(", ")}`);
+  }
+
+  return value as LogLevel;
+}
+
 export const env = {
+  logLevel: getLogLevel(process.env.LOG_LEVEL),
+
   port: getPositiveInteger(
     "PORT",
     process.env.PORT,

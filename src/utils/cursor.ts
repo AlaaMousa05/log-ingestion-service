@@ -5,7 +5,12 @@ interface CursorData {
   id: string;
 }
 
-const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const BIGINT_ID_PATTERN = /^[1-9]\d*$/;
+const MAX_BIGINT_ID = 9_223_372_036_854_775_807n;
+
+function isValidId(value: string): boolean {
+  return BIGINT_ID_PATTERN.test(value) && BigInt(value) <= MAX_BIGINT_ID;
+}
 
 export function encodeCursor(data: CursorData): string {
   return Buffer.from(JSON.stringify(data)).toString("base64url");
@@ -26,7 +31,7 @@ export function decodeCursor(
       typeof parsed.timestamp !== "string" ||
       typeof parsed.id !== "string" ||
       !parseIsoTimestamp(parsed.timestamp) ||
-      !UUID_PATTERN.test(parsed.id)
+      !isValidId(parsed.id)
     ) {
       return null;
     }

@@ -1,4 +1,5 @@
 import { sql } from "drizzle-orm";
+import { migrate } from "drizzle-orm/node-postgres/migrator"; // 👈 1. استيراد دالة المايجريشن
 import { env } from "./config/env.js";
 import { db } from "./db/index.js";
 import { buildApp } from "./server/app.js";
@@ -30,8 +31,12 @@ process.once("SIGTERM", () => void shutdown("SIGTERM"));
 process.once("SIGINT", () => void shutdown("SIGINT"));
 
 try {
-
   await db.execute(sql`SELECT 1`);
+
+  // 👈 2. تشغيل المايجريشن برمجياً قبل الاستماع للطلبات
+  app.log.info("Applying database migrations...");
+  await migrate(db, { migrationsFolder: "./src/db/migrations" });
+  app.log.info("Database migrations applied successfully.");
 
   await app.listen({
     port: env.port,

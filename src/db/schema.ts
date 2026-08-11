@@ -1,65 +1,51 @@
 import {
   pgTable,
-  uuid,
+  bigserial,
   timestamp,
-  varchar,
   text,
   jsonb,
   index,
+  pgEnum,
+  primaryKey,
 } from "drizzle-orm/pg-core";
-import { sql } from "drizzle-orm";
+
+// 1. Enum متوافق مع قيم LOG_LEVELS في مشروعك
+export const logLevelEnum = pgEnum("log_level", [
+  "debug",
+  "info",
+  "warn",
+  "error",
+]);
+
 export const logs = pgTable(
   "logs",
   {
-    id: uuid("id").defaultRandom().primaryKey(),
-
-    timestamp: timestamp("timestamp", {
-      withTimezone: true,
-    }).notNull(),
-
-    level: varchar("level", {
-      length: 10,
-    }).notNull(),
-
-    service: varchar("service", {
-      length: 255,
-    }).notNull(),
-
+    // 2. استخدام bigserial التابع لـ Drizzle ORM بدلاً من bigidentity
+    id: bigserial("id", { mode: "bigint" }).notNull(),
+    timestamp: timestamp("timestamp", { withTimezone: true }).notNull(),
+    level: logLevelEnum("level").notNull(),
+    service: text("service").notNull(),
     message: text("message").notNull(),
-
-    attributes: jsonb("attributes")
-      .$type<Record<string, string | number | boolean>>()
-      .notNull()
-      .default({}),
-
- 
-    attributesText: jsonb("attributes_text")
-      .$type<Record<string, string>>()
-      .notNull()
-      .default({}),
-
-    createdAt: timestamp("created_at", {
-      withTimezone: true,
-    })
+    attributes: jsonb("attributes").$type<Record<string, unknown>>().notNull().default({}),
+    attributesText: jsonb("attributes_text").$type<Record<string, string>>().notNull().default({}),
+    createdAt: timestamp("created_at", { withTimezone: true })
       .defaultNow()
       .notNull(),
   },
- (table) => ({
-  cursorIndex: index("logs_cursor_idx")
-    .on(table.timestamp, table.id),
+  (table) => [
+    // 3. المفتاح الرئيسي المركب
+    primaryKey({ columns: [table.timestamp, table.id] }),
 
-
-  serviceTimestampIdIndex: index("logs_service_timestamp_id_idx")
-    .on(table.service, sql`${table.timestamp} DESC`, sql`${table.id} DESC`),
-
-  levelTimestampIdIndex: index("logs_level_timestamp_id_idx")
-    .on(table.level, sql`${table.timestamp} DESC`, sql`${table.id} DESC`),
-
-  messageSearchIndex: index("logs_message_search_idx")
-  .using("gin", sql`LOWER(${table.message}) gin_trgm_ops`),
-
-
-  attributesTextIndex: index("logs_attributes_text_gin_idx")
-    .using("gin", sql`${table.attributesText} jsonb_path_ops`),
-}),
+    // 4. الفهارس المركبة الفعالة
+    index("idx_logs_service_timestamp_id").on(
+      table.service,
+      table.timestamp,
+      table.id
+    ),
+    index("idx_logs_level_timestamp_id").on(
+      table.level,
+      table.timestamp,
+      table.id
+    ),
+  ]
 );

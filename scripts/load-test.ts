@@ -20,8 +20,8 @@ function positiveInteger(name: string, fallback: number): number {
 }
 
 const totalLogs = positiveInteger("TOTAL_LOGS", 1_000_000);
-const batchSize = positiveInteger("BATCH_SIZE", 1_000);
-const workers = positiveInteger("WORKERS", 4);
+const batchSize = positiveInteger("BATCH_SIZE", 2_500);
+const workers = positiveInteger("WORKERS", 6);
 const url = process.env.LOG_SERVICE_URL ?? "http://localhost:8080";
 const captureDockerStats = process.env.CAPTURE_DOCKER_STATS === "true";
 

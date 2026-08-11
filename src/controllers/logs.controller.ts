@@ -3,7 +3,8 @@ import { ingestLogs } from "../services/logs.service.js";
 import { aggregateLogs, findLogs } from "../repositories/logs.repository.js";
 import { decodeCursor, encodeCursor } from "../utils/cursor.js";
 import { parseIsoTimestamp } from "../utils/timestamp.js";
-
+// أضف LogLevel إلى قائمة الـ imports من ملف log.types.js
+import type { LogLevel } from "../types/log.types.js";
 const VALID_LEVELS = ["debug", "info", "warn", "error"] as const;
 
 type QueryParameters = Record<string, string | undefined>;
@@ -142,13 +143,13 @@ export async function queryLogsController(
 
   const rows = await findLogs({
     ...(query.service && { service: query.service }),
-    ...(query.level && { level: query.level }),
+    ...(query.level && { level: query.level as LogLevel }), // 👈 إضافة as LogLevel هنا
     ...(since && { since }),
     ...(until && { until }),
     ...(query.q && { message: query.q }),
     ...(Object.keys(attributes).length > 0 && { attributes }),
     ...(cursor && { cursor }),
-    // The repository returns exactly its requested limit.  The controller owns
+    // The repository returns exactly its requested limit. The controller owns
     // the one-row look-ahead needed to generate a next cursor.
     limit: limit + 1,
   });
@@ -159,7 +160,7 @@ export async function queryLogsController(
 
   return reply.send({
     logs: logs.map((log) => ({
-      id: log.id,
+      id: log.id.toString(),
       timestamp: log.timestamp.toISOString(),
       level: log.level,
       service: log.service,
@@ -167,7 +168,7 @@ export async function queryLogsController(
       attributes: log.attributes,
     })),
     next_cursor: hasMore && last
-      ? encodeCursor({ timestamp: last.timestamp.toISOString(), id: last.id })
+      ? encodeCursor({ timestamp: last.timestamp.toISOString(), id: last.id.toString() })
       : null,
   });
 }
@@ -222,7 +223,7 @@ export async function aggregateLogsController(
     until,
     bucket,
     ...(query.service && { service: query.service }),
-    ...(query.level && { level: query.level }),
+    ...(query.level && { level: query.level as LogLevel }), // 👈 إضافة as LogLevel هنا
     ...(query.q && { message: query.q }),
     ...(Object.keys(attributes).length > 0 && { attributes }),
     ...(query.group_by && {
