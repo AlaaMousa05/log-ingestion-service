@@ -167,4 +167,20 @@ describe("validateLogEntry", () => {
         "attributes must be a flat object with string, number, or boolean values",
     });
   });
+
+  it.each([
+    ["service", { service: "auth\0internal" }, "service must not contain NUL characters"],
+    ["message", { message: "login\0successful" }, "message must not contain NUL characters"],
+    ["attribute", { attributes: { request_id: "abc\0def" } }, "attribute values must not contain NUL characters"],
+  ])("rejects NUL characters in %s", (_field, overrides, reason) => {
+    const result = validateLogEntry({
+      timestamp: "2026-08-09T20:00:00.000Z",
+      level: "info",
+      service: "auth",
+      message: "test",
+      ...overrides,
+    });
+
+    expect(result).toEqual({ valid: false, reason });
+});
 });

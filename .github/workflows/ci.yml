@@ -14,8 +14,8 @@ jobs:
           POSTGRES_DB: log_ingestion
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: postgres
-          ports:
-            - 5432:5432
+        ports:
+          - 5432:5432
         options: >-
           --health-cmd "pg_isready -U postgres -d log_ingestion"
           --health-interval 5s
@@ -41,5 +41,6 @@ jobs:
             sleep 2
           done
           exit 1
+      - run: bash scripts/audit-run.sh
       - if: always()
         run: docker compose down -v

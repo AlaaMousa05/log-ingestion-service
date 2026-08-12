@@ -12,7 +12,7 @@ if (!databaseUrl) {
 
 export const pool = new Pool({
   connectionString: databaseUrl,
-  max: 5,
+  max: 7,
   idleTimeoutMillis: 30000,
   connectionTimeoutMillis: 5000,
 });

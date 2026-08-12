@@ -7,6 +7,10 @@ import { parseIsoTimestamp } from "../utils/timestamp.js";
 
 const MAX_FUTURE_MS = 5 * 60 * 1000;
 
+function containsNullCharacter(value: string): boolean {
+  return value.includes("\0");
+}
+
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   if (typeof value !== "object" || value === null) {
     return false;
@@ -101,6 +105,13 @@ export function validateLogEntry(
     };
   }
 
+  if (containsNullCharacter(service)) {
+    return {
+      valid: false,
+      reason: "service must not contain NUL characters",
+    };
+  }
+
   const message = value.message;
 
   if (typeof message !== "string" || message.trim() === "") {
@@ -110,6 +121,13 @@ export function validateLogEntry(
     };
   }
 
+
+  if (containsNullCharacter(message)) {
+    return {
+      valid: false,
+      reason: "message must not contain NUL characters",
+    };
+  }
   const attributes = value.attributes;
 
   if (attributes !== undefined && !isValidAttributes(attributes)) {
@@ -119,6 +137,19 @@ export function validateLogEntry(
     };
   }
 
+
+  if (
+    attributes !== undefined &&
+    Object.values(attributes).some(
+      (attribute) =>
+        typeof attribute === "string" && containsNullCharacter(attribute),
+    )
+  ) {
+    return {
+      valid: false,
+      reason: "attribute values must not contain NUL characters",
+    };
+  }
   return {
     valid: true,
     log: {

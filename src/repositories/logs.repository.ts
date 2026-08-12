@@ -185,6 +185,26 @@ export async function aggregateLogs(query: AggregateQuery) {
         ? logs.level
         : sql`NULL`;
 
+  if (!query.groupBy) {
+    const result = await db.execute<{
+      start: Date;
+      group: null;
+      count: string;
+    }>(sql`
+      WITH aggregated AS MATERIALIZED (
+        SELECT ${bucketExpression} AS start, cast(count(*) as integer) AS count
+        FROM ${logs}
+        WHERE ${and(...conditions)}
+        GROUP BY ${bucketExpression}
+      )
+      SELECT start, NULL::text AS "group", count
+      FROM aggregated
+      ORDER BY start
+    `);
+
+    return result.rows;
+  }
+
   const queryBuilder = db
     .select({
       start: bucketExpression,

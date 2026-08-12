@@ -60,6 +60,42 @@ describe("HTTP contract", () => {
     });
   });
 
+  it("preserves COPY text special characters and rejects NUL values per entry", async () => {
+    const service = "checkout\\\\N\tquoted\"\ncarriage\r??";
+    const message = "payment \"declined\"\\retry\tline one\nline two\r???";
+    const attributes = {
+      quoted: "\"value\"",
+      slash: "a\\b",
+      whitespace: "tab\tnewline\ncarriage\r",
+      unicode: "????? ??",
+    };
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/logs",
+      payload: {
+        logs: [
+          log({ service, message, attributes }),
+          log({ message: "contains\0nul" }),
+        ],
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual({
+      accepted: 1,
+      rejected: [{ index: 1, reason: "message must not contain NUL characters" }],
+    });
+
+    const result = await getJson<{ logs: Array<LogEntry> }>(
+      `/logs?service=${encodeURIComponent(service)}`,
+    );
+
+    expect(result.response.statusCode).toBe(200);
+    expect(result.body.logs).toHaveLength(1);
+    expect(result.body.logs[0]).toMatchObject({ service, message, attributes });
+
+  });
   it("returns 400 for invalid ingestion bodies and malformed JSON", async () => {
     const invalidCases = [
       {},
