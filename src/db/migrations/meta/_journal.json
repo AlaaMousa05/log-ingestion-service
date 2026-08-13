@@ -8,6 +8,13 @@
       "when": 1786479978963,
       "tag": "0000_past_namor",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1786614697911,
+      "tag": "0001_tune_logs_autovacuum",
+      "breakpoints": true
     }
   ]
 }

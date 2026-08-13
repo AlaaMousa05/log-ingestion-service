@@ -1,5 +1,5 @@
 import { sql } from "drizzle-orm";
-import { migrate } from "drizzle-orm/node-postgres/migrator"; // 👈 1. استيراد دالة المايجريشن
+import { migrate } from "drizzle-orm/node-postgres/migrator";
 import { env } from "./config/env.js";
 import { db } from "./db/index.js";
 import { buildApp } from "./server/app.js";
@@ -33,7 +33,8 @@ process.once("SIGINT", () => void shutdown("SIGINT"));
 try {
   await db.execute(sql`SELECT 1`);
 
-  // 👈 2. تشغيل المايجريشن برمجياً قبل الاستماع للطلبات
+  // Apply migrations programmatically before listening for requests, so /health can never
+  // report ready until the schema is up to date.
   app.log.info("Applying database migrations...");
   await migrate(db, { migrationsFolder: "./src/db/migrations" });
   app.log.info("Database migrations applied successfully.");

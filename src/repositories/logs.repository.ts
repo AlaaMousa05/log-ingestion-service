@@ -1,4 +1,4 @@
-import { db, pool } from "../db/index.js";
+import { db, ingestPool } from "../db/index.js";
 import { logs } from "../db/schema.js";
 import type { LogEntry, LogQuery, AggregateQuery } from "../types/log.types.js";
 import {
@@ -66,7 +66,7 @@ export async function insertLogs(entries: LogEntry[]) {
     return 0;
   }
 
-  const client = await pool.connect();
+  const client = await ingestPool.connect();
 
   try {
     const copyStream = client.query(

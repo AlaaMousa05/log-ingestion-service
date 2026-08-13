@@ -1,11 +1,12 @@
 import type { FastifyInstance } from "fastify";
-import { db } from "../db/index.js";
-import { sql } from "drizzle-orm";
+import { healthPool } from "../db/index.js";
 
 export async function healthRoute(app: FastifyInstance) {
   app.get("/health", async (_request, reply) => {
     try {
-      await db.execute(sql`SELECT 1`);
+      // Dedicated pool (see src/db/index.ts) -- a liveness check must never queue behind
+      // application query/ingestion load.
+      await healthPool.query("SELECT 1");
 
       return reply.status(200).send({
         status: "ok",

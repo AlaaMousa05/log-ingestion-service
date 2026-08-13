@@ -3,7 +3,6 @@ import { ingestLogs } from "../services/logs.service.js";
 import { aggregateLogs, findLogs } from "../repositories/logs.repository.js";
 import { decodeCursor, encodeCursor } from "../utils/cursor.js";
 import { parseIsoTimestamp } from "../utils/timestamp.js";
-// أضف LogLevel إلى قائمة الـ imports من ملف log.types.js
 import type { LogLevel } from "../types/log.types.js";
 const VALID_LEVELS = ["debug", "info", "warn", "error"] as const;
 
@@ -143,7 +142,7 @@ export async function queryLogsController(
 
   const rows = await findLogs({
     ...(query.service && { service: query.service }),
-    ...(query.level && { level: query.level as LogLevel }), // 👈 إضافة as LogLevel هنا
+    ...(query.level && { level: query.level as LogLevel }),
     ...(since && { since }),
     ...(until && { until }),
     ...(query.q && { message: query.q }),
@@ -223,7 +222,7 @@ export async function aggregateLogsController(
     until,
     bucket,
     ...(query.service && { service: query.service }),
-    ...(query.level && { level: query.level as LogLevel }), // 👈 إضافة as LogLevel هنا
+    ...(query.level && { level: query.level as LogLevel }),
     ...(query.q && { message: query.q }),
     ...(Object.keys(attributes).length > 0 && { attributes }),
     ...(query.group_by && {

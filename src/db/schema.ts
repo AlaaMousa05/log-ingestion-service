@@ -9,7 +9,7 @@ import {
   primaryKey,
 } from "drizzle-orm/pg-core";
 
-// 1. Enum متوافق مع قيم LOG_LEVELS في مشروعك
+// Mirrors LOG_LEVELS in src/types/log.types.ts
 export const logLevelEnum = pgEnum("log_level", [
   "debug",
   "info",
@@ -20,7 +20,6 @@ export const logLevelEnum = pgEnum("log_level", [
 export const logs = pgTable(
   "logs",
   {
-    // 2. استخدام bigserial التابع لـ Drizzle ORM بدلاً من bigidentity
     id: bigserial("id", { mode: "bigint" }).notNull(),
     timestamp: timestamp("timestamp", { withTimezone: true }).notNull(),
     level: logLevelEnum("level").notNull(),
@@ -33,10 +32,11 @@ export const logs = pgTable(
       .notNull(),
   },
   (table) => [
-    // 3. المفتاح الرئيسي المركب
+    // Composite primary key: also backs descending pagination/cursor comparisons and the
+    // retention delete's timestamp range scan (see src/repositories/*.ts).
     primaryKey({ columns: [table.timestamp, table.id] }),
 
-    // 4. الفهارس المركبة الفعالة
+    // Query-aligned composite indexes for the two single-dimension filters.
     index("idx_logs_service_timestamp_id").on(
       table.service,
       table.timestamp,
