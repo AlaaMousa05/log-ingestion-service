@@ -92,12 +92,22 @@ export const env = {
     100,
   ),
 
-  // Ingestion can tolerate waiting for a connection -- a slow-but-eventually-accepted COPY beats
-  // a dropped batch. Queries are a different contract: a query that has to wait 8s for a
-  // connection just to then run is exactly what inflates GET /logs/aggregate's own p95 under
-  // heavy concurrent load, without helping ingestion at all (see
-  // specs/001-benchmark-perf-gap/diagnostics.md Round 4/5). Query requests should fail fast
-  // (503) instead, matching an interactive-query contract rather than a bulk-write one.
+  // How long a request may wait for a pooled connection before it is shed with 503.
+  //
+  // This is a budget for WAITING TO BE SERVED, so it must exceed the time the work itself
+  // takes. Setting it below the observed service time does not make queries faster -- it
+  // converts slow queries into failed ones, because waiters are culled faster than workers can
+  // release connections. Measured directly against the official benchmark: submission
+  // 7VQZVDZZXEMTPTY36FM8S0R78 (5000ms budget) returned zero errors in exactly the two stages
+  // where aggregate p95 stayed under 5s, and shed load in the two where it did not; submission
+  // 5VZZZZYZQ9C67PKQ9QVJ3ZW4Y (2500ms query budget) had every stage's p95 above the budget and
+  // shed 14-46% of reads in all four.
+  //
+  // 8000ms exceeds the worst aggregate p95 recorded in either official run (5.99s), so both
+  // pools use the same budget by default. They stay separately configurable because ingestion
+  // (COPY holds a connection for a whole batch) and querying have genuinely different service
+  // times, and a future measurement may justify splitting them again -- but only upward from
+  // the measured service time, never below it.
   dbPoolConnectTimeoutMs: getPositiveInteger(
     "DB_POOL_CONNECT_TIMEOUT_MS",
     process.env.DB_POOL_CONNECT_TIMEOUT_MS,
@@ -108,7 +118,7 @@ export const env = {
   dbQueryPoolConnectTimeoutMs: getPositiveInteger(
     "DB_QUERY_POOL_CONNECT_TIMEOUT_MS",
     process.env.DB_QUERY_POOL_CONNECT_TIMEOUT_MS,
-    2_500,
+    8_000,
     30_000,
   ),
 };
