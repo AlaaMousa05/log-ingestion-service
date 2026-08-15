@@ -1,7 +1,10 @@
 import "dotenv/config";
 
-const LOG_LEVELS = ["fatal", "error", "warn", "info", "debug", "trace", "silent"] as const;
-type LogLevel = (typeof LOG_LEVELS)[number];
+// Pino's own severity levels, which control this service's diagnostic output.
+// Deliberately distinct from LOG_LEVELS in src/types/log.types.ts, which are the
+// levels of the logs this service ingests.
+const PINO_LOG_LEVELS = ["fatal", "error", "warn", "info", "debug", "trace", "silent"] as const;
+type PinoLogLevel = (typeof PINO_LOG_LEVELS)[number];
 
 function getPositiveInteger(
   name: string,
@@ -30,16 +33,16 @@ function getPositiveInteger(
   return parsed;
 }
 
-function getLogLevel(value: string | undefined): LogLevel {
+function getLogLevel(value: string | undefined): PinoLogLevel {
   if (value === undefined || value === "") {
     return "warn";
   }
 
-  if (!LOG_LEVELS.includes(value as LogLevel)) {
-    throw new Error(`LOG_LEVEL must be one of: ${LOG_LEVELS.join(", ")}`);
+  if (!PINO_LOG_LEVELS.includes(value as PinoLogLevel)) {
+    throw new Error(`LOG_LEVEL must be one of: ${PINO_LOG_LEVELS.join(", ")}`);
   }
 
-  return value as LogLevel;
+  return value as PinoLogLevel;
 }
 
 export const env = {
@@ -52,8 +55,8 @@ export const env = {
     65_535,
   ),
 
-  databaseUrl:
-    process.env.DATABASE_URL ?? "",
+  // Validated at startup by src/db/index.ts, which is the only consumer.
+  databaseUrl: process.env.DATABASE_URL ?? "",
 
   retentionDays: getPositiveInteger(
     "RETENTION_DAYS",
@@ -120,5 +123,31 @@ export const env = {
     process.env.DB_QUERY_POOL_CONNECT_TIMEOUT_MS,
     8_000,
     30_000,
+  ),
+
+  // How long POST /logs buffers validated rows from concurrent requests before
+  // issuing one shared COPY for the whole window, instead of one COPY per
+  // request. Confirmed bottleneck (see specs/001-benchmark-perf-gap/
+  // diagnostics.md): Postgres CPU sits pinned at 100-107% in every official
+  // stage regardless of pool/timeout config -- the cost is per-operation, not
+  // per-row, so merging many small COPYs into fewer larger ones directly
+  // targets it. 15ms is a starting point (small relative to the multi-second
+  // aggregate latencies already observed, so it can't itself become the
+  // bottleneck) -- tune from real Docker-limited measurement, not guesswork.
+  ingestCoalesceWindowMs: getPositiveInteger(
+    "INGEST_COALESCE_WINDOW_MS",
+    process.env.INGEST_COALESCE_WINDOW_MS,
+    15,
+    1_000,
+  ),
+
+  // Safety valve: flush early if a single window accumulates this many rows,
+  // so pathological concurrency can't grow one COPY unboundedly large or
+  // stall every request in the window behind a slow timer.
+  ingestCoalesceMaxBatchEntries: getPositiveInteger(
+    "INGEST_COALESCE_MAX_BATCH_ENTRIES",
+    process.env.INGEST_COALESCE_MAX_BATCH_ENTRIES,
+    10_000,
+    1_000_000,
   ),
 };

@@ -16,27 +16,27 @@ export function encodeCursor(data: CursorData): string {
   return Buffer.from(JSON.stringify(data)).toString("base64url");
 }
 
-export function decodeCursor(
-  cursor: string,
-): CursorData | null {
+export function decodeCursor(cursor: string): CursorData | null {
   try {
-    const decoded = Buffer.from(
-      cursor,
-      "base64url",
-    ).toString("utf8");
+    const decoded = Buffer.from(cursor, "base64url").toString("utf8");
+    const parsed: unknown = JSON.parse(decoded);
 
-    const parsed = JSON.parse(decoded);
+    if (typeof parsed !== "object" || parsed === null) {
+      return null;
+    }
+
+    const { timestamp, id } = parsed as Partial<CursorData>;
 
     if (
-      typeof parsed.timestamp !== "string" ||
-      typeof parsed.id !== "string" ||
-      !parseIsoTimestamp(parsed.timestamp) ||
-      !isValidId(parsed.id)
+      typeof timestamp !== "string" ||
+      typeof id !== "string" ||
+      !parseIsoTimestamp(timestamp) ||
+      !isValidId(id)
     ) {
       return null;
     }
 
-    return parsed;
+    return { timestamp, id };
   } catch {
     return null;
   }

@@ -1,6 +1,10 @@
 const ISO_8601_TIMESTAMP = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d{1,9})?(Z|[+-]\d{2}:\d{2})$/;
 
-
+/**
+ * Parses a strict ISO 8601 instant. `new Date()` alone is too permissive — it
+ * accepts partial dates and silently rolls overflowing fields (month 13, day 32)
+ * into the next period — so the shape and the field ranges are checked first.
+ */
 export function parseIsoTimestamp(value: string): Date | null {
   const match = ISO_8601_TIMESTAMP.exec(value);
 

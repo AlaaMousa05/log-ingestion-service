@@ -1,4 +1,4 @@
-import Fastify from "fastify";
+import Fastify, { type FastifyError } from "fastify";
 import { registerRoutes } from "./routes.js";
 import { ingestPool, queryPool, healthPool } from "../db/index.js";
 import { env } from "../config/env.js";
@@ -51,11 +51,9 @@ export function buildApp() {
   });
 
   app.setErrorHandler((error, request, reply) => {
-    const fastifyError = error as {
-      code?: string;
-      message: string;
-      statusCode?: number;
-    };
+    // Fastify types the handler's error as `unknown`; every error reaching it is
+    // a FastifyError, whose `statusCode` is set for errors it raised itself.
+    const fastifyError = error as FastifyError;
 
     if (fastifyError.code === "FST_ERR_CTP_INVALID_JSON_BODY") {
       return reply.status(400).send({ error: "malformed JSON body" });
@@ -74,14 +72,15 @@ export function buildApp() {
 
     request.log.error(error);
 
-    return reply.status(
+    // Client errors carry a usable message; anything else is an internal fault
+    // whose details must not reach the caller.
+    const clientStatusCode =
       fastifyError.statusCode && fastifyError.statusCode < 500
         ? fastifyError.statusCode
-        : 500,
-    ).send({
-      error: fastifyError.statusCode && fastifyError.statusCode < 500
-        ? fastifyError.message
-        : "internal server error",
+        : undefined;
+
+    return reply.status(clientStatusCode ?? 500).send({
+      error: clientStatusCode ? fastifyError.message : "internal server error",
     });
   });
 

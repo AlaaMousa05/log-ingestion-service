@@ -14,11 +14,19 @@ export interface RetentionOptions {
   deleteBatch?: (cutoff: Date, batchSize: number) => Promise<number>;
 }
 
-export function retentionCutoff(now = new Date()): Date {
+/** Logs older than this instant are eligible for deletion. */
+function retentionCutoff(now = new Date()): Date {
   return new Date(now.getTime() - env.retentionDays * 24 * 60 * 60 * 1_000);
 }
 
-
+/**
+ * Deletes expired logs in bounded batches. `maxBatches` caps how much work one
+ * run may do so a large backlog is drained over several runs instead of holding
+ * the database busy in a single long-running delete.
+ *
+ * The `options` overrides exist for tests; production callers pass nothing and
+ * get the configured retention window, batch size, and cap.
+ */
 export async function deleteExpiredLogs(
   options: RetentionOptions = {},
 ): Promise<RetentionResult> {

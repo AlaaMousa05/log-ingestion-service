@@ -29,7 +29,6 @@ export function startRetentionJob(): RetentionJob {
     }
   };
 
-
   void run();
   const timer = setInterval(() => void run(), RETENTION_INTERVAL_MS);
   timer.unref();

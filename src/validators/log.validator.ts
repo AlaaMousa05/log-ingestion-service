@@ -2,11 +2,25 @@ import {
   LOG_LEVELS,
   type LogAttributes,
   type LogEntry,
+  type LogLevel,
 } from "../types/log.types.js";
 import { parseIsoTimestamp } from "../utils/timestamp.js";
 
+/**
+ * Clock skew between the caller and this service is expected, so timestamps are
+ * allowed to run slightly ahead of now before being rejected as bogus.
+ */
 const MAX_FUTURE_MS = 5 * 60 * 1000;
 
+export type ValidationResult =
+  | { valid: true; log: LogEntry }
+  | { valid: false; reason: string };
+
+function invalid(reason: string): ValidationResult {
+  return { valid: false, reason };
+}
+
+/** PostgreSQL text columns cannot store NUL, so entries carrying one are rejected. */
 function containsNullCharacter(value: string): boolean {
   return value.includes("\0");
 }
@@ -45,98 +59,64 @@ function isValidAttributes(value: unknown): value is LogAttributes {
   return true;
 }
 
-export function validateLogEntry(
-  value: unknown,
-): { valid: true; log: LogEntry } | { valid: false; reason: string } {
+export function validateLogEntry(value: unknown): ValidationResult {
   if (!isPlainObject(value)) {
-    return {
-      valid: false,
-      reason: "log entry must be an object",
-    };
+    return invalid("log entry must be an object");
   }
 
   const timestamp = value.timestamp;
 
   if (typeof timestamp !== "string") {
-    return {
-      valid: false,
-      reason: "timestamp is required",
-    };
+    return invalid("timestamp is required");
   }
 
   const parsedTimestamp = parseIsoTimestamp(timestamp);
 
   if (!parsedTimestamp) {
-    return {
-      valid: false,
-      reason: "invalid timestamp",
-    };
+    return invalid("invalid timestamp");
   }
 
   if (parsedTimestamp.getTime() >= Date.now() + MAX_FUTURE_MS) {
-    return {
-      valid: false,
-      reason: "timestamp cannot be more than five minutes in the future",
-    };
+    return invalid("timestamp cannot be more than five minutes in the future");
   }
 
   const level = value.level;
 
   if (typeof level !== "string") {
-    return {
-      valid: false,
-      reason: "level is required",
-    };
+    return invalid("level is required");
   }
 
-  if (!LOG_LEVELS.includes(level as typeof LOG_LEVELS[number])) {
-    return {
-      valid: false,
-      reason: `invalid level: '${level}'`,
-    };
+  if (!LOG_LEVELS.includes(level as LogLevel)) {
+    return invalid(`invalid level: '${level}'`);
   }
 
   const service = value.service;
 
   if (typeof service !== "string" || service.trim() === "") {
-    return {
-      valid: false,
-      reason: "service must be a non-empty string",
-    };
+    return invalid("service must be a non-empty string");
   }
 
   if (containsNullCharacter(service)) {
-    return {
-      valid: false,
-      reason: "service must not contain NUL characters",
-    };
+    return invalid("service must not contain NUL characters");
   }
 
   const message = value.message;
 
   if (typeof message !== "string" || message.trim() === "") {
-    return {
-      valid: false,
-      reason: "message must be a non-empty string",
-    };
+    return invalid("message must be a non-empty string");
   }
-
 
   if (containsNullCharacter(message)) {
-    return {
-      valid: false,
-      reason: "message must not contain NUL characters",
-    };
+    return invalid("message must not contain NUL characters");
   }
+
   const attributes = value.attributes;
 
   if (attributes !== undefined && !isValidAttributes(attributes)) {
-    return {
-      valid: false,
-      reason: "attributes must be a flat object with string, number, or boolean values",
-    };
+    return invalid(
+      "attributes must be a flat object with string, number, or boolean values",
+    );
   }
-
 
   if (
     attributes !== undefined &&
@@ -145,16 +125,14 @@ export function validateLogEntry(
         typeof attribute === "string" && containsNullCharacter(attribute),
     )
   ) {
-    return {
-      valid: false,
-      reason: "attribute values must not contain NUL characters",
-    };
+    return invalid("attribute values must not contain NUL characters");
   }
+
   return {
     valid: true,
     log: {
       timestamp,
-      level: level as LogEntry["level"],
+      level: level as LogLevel,
       service,
       message,
       attributes: attributes ?? {},

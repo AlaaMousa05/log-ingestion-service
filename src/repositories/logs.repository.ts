@@ -1,6 +1,14 @@
 import { db, ingestPool } from "../db/index.js";
 import { logs } from "../db/schema.js";
-import type { LogEntry, LogQuery, AggregateQuery } from "../types/log.types.js";
+import type {
+  AggregateBucket,
+  AggregateQuery,
+  AttributeFilters,
+  BucketSize,
+  LogAttributes,
+  LogEntry,
+  LogQuery,
+} from "../types/log.types.js";
 import {
   and,
   desc,
@@ -8,6 +16,7 @@ import {
   gte,
   lt,
   sql,
+  type SQL,
 } from "drizzle-orm";
 import { from as copyFrom } from "pg-copy-streams";
 import { Readable } from "node:stream";
@@ -17,13 +26,43 @@ function escapeLikePattern(value: string): string {
   return value.replace(/[\\%_]/g, "\\$&");
 }
 
-function toAttributesText(
-  attributes: Record<string, string | number | boolean>,
-): Record<string, string> {
+/**
+ * Case-insensitive substring match. The caller's text is treated as a literal,
+ * so `%` and `_` in a search term match themselves rather than acting as
+ * wildcards.
+ */
+function messageMatches(message: string): SQL {
+  return sql`LOWER(${logs.message}) LIKE ${`%${escapeLikePattern(message.toLowerCase())}%`} ESCAPE '\\'`;
+}
+
+/**
+ * Containment match against `attributes_text`, the all-strings mirror of
+ * `attributes`, so a filter value from the query string matches regardless of
+ * the JSON type it was ingested as.
+ */
+function attributesContain(attributes: AttributeFilters): SQL {
+  return sql`${logs.attributesText} @> ${JSON.stringify(attributes)}::jsonb`;
+}
+
+/**
+ * Fixed origin for `date_bin`, so bucket boundaries depend only on the bucket
+ * width and never on the requested time window — two overlapping queries return
+ * buckets that line up exactly.
+ */
+const BUCKET_ORIGIN = sql`TIMESTAMPTZ '2026-01-01 00:00:00+00'`;
+
+const BUCKET_EXPRESSIONS: Record<BucketSize, SQL<string>> = {
+  "1m": sql`date_bin('1 minute', ${logs.timestamp}, ${BUCKET_ORIGIN})`,
+  "5m": sql`date_bin('5 minutes', ${logs.timestamp}, ${BUCKET_ORIGIN})`,
+  "1h": sql`date_bin('1 hour', ${logs.timestamp}, ${BUCKET_ORIGIN})`,
+  "1d": sql`date_bin('1 day', ${logs.timestamp}, ${BUCKET_ORIGIN})`,
+};
+
+function toAttributesText(attributes: LogAttributes): Record<string, string> {
   const text: Record<string, string> = {};
 
-  for (const key in attributes) {
-    text[key] = String(attributes[key]);
+  for (const [key, value] of Object.entries(attributes)) {
+    text[key] = String(value);
   }
 
   return text;
@@ -47,17 +86,15 @@ function copyTextField(value: string): string {
 }
 
 function toCopyTextRow(entry: LogEntry): string {
-  const attrs = entry.attributes ?? {};
-  const strAttrs = JSON.stringify(attrs);
-  const strAttrsText = JSON.stringify(toAttributesText(attrs));
+  const attributes = entry.attributes ?? {};
 
   return [
     entry.timestamp,
     entry.level,
     entry.service,
     entry.message,
-    strAttrs,
-    strAttrsText,
+    JSON.stringify(attributes),
+    JSON.stringify(toAttributesText(attributes)),
   ].map(copyTextField).join("\t") + "\n";
 }
 
@@ -118,15 +155,11 @@ export async function findLogs(query: LogQuery) {
   }
 
   if (query.message) {
-    conditions.push(
-      sql`LOWER(${logs.message}) LIKE ${`%${escapeLikePattern(query.message.toLowerCase())}%`} ESCAPE '\\'`,
-    );
+    conditions.push(messageMatches(query.message));
   }
 
   if (query.attributes && Object.keys(query.attributes).length > 0) {
-    conditions.push(
-      sql`${logs.attributesText} @> ${JSON.stringify(query.attributes)}::jsonb`,
-    );
+    conditions.push(attributesContain(query.attributes));
   }
 
   if (query.cursor) {
@@ -143,7 +176,9 @@ export async function findLogs(query: LogQuery) {
     .limit(query.limit);
 }
 
-export async function aggregateLogs(query: AggregateQuery) {
+export async function aggregateLogs(
+  query: AggregateQuery,
+): Promise<AggregateBucket[]> {
   const conditions = [
     gte(logs.timestamp, query.since),
     lt(logs.timestamp, query.until),
@@ -158,39 +193,17 @@ export async function aggregateLogs(query: AggregateQuery) {
   }
 
   if (query.message) {
-    conditions.push(
-      sql`LOWER(${logs.message}) LIKE ${`%${escapeLikePattern(query.message.toLowerCase())}%`} ESCAPE '\\'`,
-    );
+    conditions.push(messageMatches(query.message));
   }
 
   if (query.attributes && Object.keys(query.attributes).length > 0) {
-    conditions.push(
-      sql`${logs.attributesText} @> ${JSON.stringify(query.attributes)}::jsonb`,
-    );
+    conditions.push(attributesContain(query.attributes));
   }
 
-  const bucketExpression =
-    query.bucket === "1m"
-      ? sql`date_bin('1 minute', ${logs.timestamp}, TIMESTAMPTZ '2026-01-01 00:00:00+00')`
-      : query.bucket === "5m"
-        ? sql`date_bin('5 minutes', ${logs.timestamp}, TIMESTAMPTZ '2026-01-01 00:00:00+00')`
-        : query.bucket === "1h"
-          ? sql`date_bin('1 hour', ${logs.timestamp}, TIMESTAMPTZ '2026-01-01 00:00:00+00')`
-          : sql`date_bin('1 day', ${logs.timestamp}, TIMESTAMPTZ '2026-01-01 00:00:00+00')`;
-
-  const groupExpression =
-    query.groupBy === "service"
-      ? logs.service
-      : query.groupBy === "level"
-        ? logs.level
-        : sql`NULL`;
+  const bucketExpression = BUCKET_EXPRESSIONS[query.bucket];
 
   if (!query.groupBy) {
-    const result = await db.execute<{
-      start: Date;
-      group: null;
-      count: string;
-    }>(sql`
+    const result = await db.execute<AggregateBucket>(sql`
       WITH aggregated AS MATERIALIZED (
         SELECT ${bucketExpression} AS start, cast(count(*) as integer) AS count
         FROM ${logs}
@@ -205,22 +218,17 @@ export async function aggregateLogs(query: AggregateQuery) {
     return result.rows;
   }
 
-  const queryBuilder = db
+  const groupExpression =
+    query.groupBy === "service" ? logs.service : logs.level;
+
+  return db
     .select({
       start: bucketExpression,
       group: groupExpression,
       count: sql<number>`cast(count(*) as integer)`,
     })
     .from(logs)
-    .where(and(...conditions));
-
-  if (query.groupBy) {
-    return queryBuilder
-      .groupBy(bucketExpression, groupExpression)
-      .orderBy(bucketExpression);
-  }
-
-  return queryBuilder
-    .groupBy(bucketExpression)
+    .where(and(...conditions))
+    .groupBy(bucketExpression, groupExpression)
     .orderBy(bucketExpression);
 }
