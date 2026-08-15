@@ -87,8 +87,7 @@ target, HTTP error rate up to 22.10% under the Breakpoint stage. Correctness (75
 reliability (missing records: 0 in every stage) were already at maximum — the gap was entirely
 throughput/latency under load, not correctness.
 
-**Root cause, as diagnosed** (full detail and raw numbers in `specs/001-benchmark-perf-gap/`):
-PostgreSQL running at 70–107% of its single CPU core while the application sat at 5–20% — the
+**Root cause, as diagnosed**: PostgreSQL running at 70–107% of its single CPU core while the application sat at 5–20% — the
 application-side connection pool (previously a single pool, `max: 7`, 5s acquire timeout, shared by
 ingestion and queries) was queuing requests well before PostgreSQL's own capacity was the limit, and a
 burst of ingestion COPY calls could hold every available connection, starving the required aggregation
@@ -97,8 +96,8 @@ traffic behind it.
 **Local changes made and locally re-measured** (against the identical container resource limits —
 0.5 CPU/256 MB app, 1 CPU/1 GB PostgreSQL): split the connection pool (ingestion vs. query), and
 right-sized pool `max`/timeout via a batch-size-and-concurrency A/B (a naive tune looked good at one
-batch size and collapsed at another — see `specs/001-benchmark-perf-gap/diagnostics.md` for that
-story). Local load-test results (`scripts/load-test.ts`, `BATCH_SIZE=1000`) after the change:
+batch size and collapsed at another). Local load-test results (`scripts/load-test.ts`,
+`BATCH_SIZE=1000`) after the change:
 
 | Workers | Throughput before | Throughput after | Aggregate p95 after |
 |---:|---:|---:|---:|
@@ -122,7 +121,7 @@ returned `503`. Root cause: `findLogs`/`aggregateLogs` go through Drizzle, which
 timeout message only on `.cause` (Node's standard error-chaining) rather than folding it into its own
 `.message`; the pool-exhaustion classifier only checked `.message`, so it missed those cases. Fixed by
 walking the `.cause` chain; verified across 3 repeated runs post-fix with **zero** 500s (all correctly
-shed as 503). Full detail in `specs/001-benchmark-perf-gap/diagnostics.md`.
+shed as 503).
 
 **Dropped-request cliff at full scale (74% dropped at `WORKERS=128`) — root cause found and fixed.**
 A fresh full-scale local run (`TOTAL_LOGS=1000000`, default `BATCH_SIZE=2500`) surfaced something the
@@ -142,8 +141,7 @@ correct direction. Zero-config confirmation runs accepted 730,000-1,000,000 of 1
 (73-100%, see the `WORKERS=128` variance note under Known Limitations) at `WORKERS=128`, a large,
 consistent improvement over the 260,000-270,000 (26-27%) accepted before this fix even at the low end
 of that range — but not a guaranteed zero every run at this specific, most-extreme concurrency tier.
-`WORKERS=6/16/64` are reliably zero-drop across every run measured. Full matrix and every number in
-`specs/001-benchmark-perf-gap/diagnostics.md`.
+`WORKERS=6/16/64` are reliably zero-drop across every run measured.
 
 **Query latency reduced further with a per-pool timeout split.** Ingestion and queries now use
 different connection-acquire timeouts (`DB_POOL_CONNECT_TIMEOUT_MS=8000ms` for ingestion,
@@ -172,8 +170,7 @@ incremental rollup table for `GET /logs/aggregate` (real win on an unconstrained
 *negative* under the actual 0.5/1 CPU limits — ~34–45% lower ingestion throughput with no
 compensating latency/CPU benefit once rollup-maintenance itself had to compete for the single
 Postgres core) and a GIN/trigram index on `message` (write-side throughput cost with the index
-never used by the planner at the tested scale). Both are documented, not hidden, in
-`specs/001-benchmark-perf-gap/diagnostics.md`.
+never used by the planner at the tested scale). Both were measured and reverted, not hidden.
 
 Coalescing was measured the same way from the start — every number below is from this repo's own
 `docker-compose.yml` limits (0.5 CPU/256MB app, 1 CPU/1GB PostgreSQL), verified directly via
@@ -227,8 +224,7 @@ under the fixed 0.5 CPU/1 CPU resource envelope, not a bug with a further fix id
 `WORKERS=6/16/64` remain reliably at zero drops across every run measured (many, across several
 rounds). Also worth noting: the official benchmark's own achieved throughput (584-2,549 logs/sec) is
 far below what 128 local workers generate, so it's unclear whether the official load generator's
-actual concurrency model ever reaches this regime at all. Full numbers in
-`specs/001-benchmark-perf-gap/diagnostics.md` (Round 5, Part 3).
+actual concurrency model ever reaches this regime at all.
 
 **Aggregate p95 still exceeds the 1s target at large batch sizes under high concurrency.** At
 `BATCH_SIZE=2500` with 64+ concurrent ingestion workers, local aggregate p95 reaches ~1.4–3.2s
@@ -243,8 +239,7 @@ both were **reproducibly worse**, not better (throughput dropped from a consiste
 ~21–26k/s in repeated, controlled trials), likely because concentrating CPU-bound work into larger,
 less-interruptible chunks hurts fairness on a single-threaded, 0.5-CPU-limited event loop serving many
 concurrent requests at once. Both attempts were reverted; the code is unchanged from the pool-split fix
-above. Full diagnostic detail, every measurement, and the two reverted attempts are documented in
-`specs/001-benchmark-perf-gap/diagnostics.md`. Candidates not yet tried: admission control that sheds
+above. Candidates not yet tried: admission control that sheds
 excess concurrent ingestion requests at the HTTP layer before they compete for CPU/event-loop time
 (rather than only at the DB-connection-pool layer), or moving COPY-payload construction to a
 `worker_thread` — or accepting this as a genuine capacity limit of a 0.5-CPU application container at
@@ -260,8 +255,7 @@ fetched and is never revisited. This is a structural consequence of combining th
 "sorted by timestamp descending" contract with cursor pagination over client-supplied, non-monotonic
 (backfilled) timestamps — the same property any chronologically-sorted feed/timeline API has for
 concurrently-published historical content — and cannot be eliminated without changing the required sort
-order. Not attempted as a fix for exactly that reason; documented instead. Full diagnosis in
-`specs/001-benchmark-perf-gap/diagnostics.md`.
+order. Not attempted as a fix for exactly that reason; documented instead.
 
 **No GIN/trigram index** on the attribute or message-search columns — unfiltered `attr.<key>` or `q`
 queries with no `service`/`level`/tight time bound will scan more rows than an indexed approach would.
