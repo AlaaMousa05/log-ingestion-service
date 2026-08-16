@@ -108,17 +108,10 @@ describe("findLogs", () => {
 
     expect(result).toHaveLength(3);
 
-    expect(result[0]?.timestamp.toISOString()).toBe(
-      "2026-08-09T20:02:00.000Z",
-    );
-
-    expect(result[1]?.timestamp.toISOString()).toBe(
-      "2026-08-09T20:01:00.000Z",
-    );
-
-    expect(result[2]?.timestamp.toISOString()).toBe(
-      "2026-08-09T20:00:00.000Z",
-    );
+    // findLogs returns `timestamp` already formatted as the API returns it.
+    expect(result[0]?.timestamp).toBe("2026-08-09T20:02:00.000Z");
+    expect(result[1]?.timestamp).toBe("2026-08-09T20:01:00.000Z");
+    expect(result[2]?.timestamp).toBe("2026-08-09T20:00:00.000Z");
   });
 
   it("filters by service", async () => {

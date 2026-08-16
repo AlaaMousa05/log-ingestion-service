@@ -9,10 +9,14 @@ import {
 
 type LogRow = Awaited<ReturnType<typeof findLogs>>[number];
 
+/**
+ * `id` and `timestamp` already arrive in their response form (see findLogs), so
+ * this only picks fields — no per-row BigInt or Date conversion.
+ */
 function serializeLog(log: LogRow) {
   return {
-    id: log.id.toString(),
-    timestamp: log.timestamp.toISOString(),
+    id: log.id,
+    timestamp: log.timestamp,
     level: log.level,
     service: log.service,
     message: log.message,
@@ -68,7 +72,7 @@ export async function queryLogsController(
   return reply.send({
     logs: logs.map(serializeLog),
     next_cursor: hasMore && last
-      ? encodeCursor({ timestamp: last.timestamp.toISOString(), id: last.id.toString() })
+      ? encodeCursor({ timestamp: last.timestamp, id: last.id })
       : null,
   });
 }
