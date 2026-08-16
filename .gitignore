@@ -8,3 +8,6 @@ coverage/
 .DS_Store
 context.md
 specs/
+.claude/
+.specify/
+test*.pdf

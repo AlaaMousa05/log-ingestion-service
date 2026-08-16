@@ -1,24 +1,29 @@
 import { beforeAll, afterAll, beforeEach, describe, expect, it } from "vitest";
 
 import { db } from "../src/db/index.js";
-import { logs } from "../src/db/schema.js";
+import { logs, logsRollup } from "../src/db/schema.js";
 import {
   aggregateLogs,
   findLogs,
   insertLogs,
 } from "../src/repositories/logs.repository.js";
 
-beforeAll(async () => {
+/**
+ * `logs_rollup` is derived from `logs` and is kept in step by whatever writes
+ * them (ingestion writes both in one transaction; retention prunes both). A
+ * test that empties `logs` directly bypasses both, so it has to clear the
+ * derived counts too or the next aggregation sees the previous test's rows.
+ */
+async function resetLogs() {
   await db.delete(logs);
-});
+  await db.delete(logsRollup);
+}
 
-beforeEach(async () => {
-  await db.delete(logs);
-});
+beforeAll(resetLogs);
 
-afterAll(async () => {
-  await db.delete(logs);
-});
+beforeEach(resetLogs);
+
+afterAll(resetLogs);
 
 describe("insertLogs", () => {
   it("returns 0 for an empty array", async () => {

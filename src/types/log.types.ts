@@ -16,7 +16,8 @@ export type LogAttributes = Record<string, string | number | boolean>;
 
 /**
  * Attribute filters arrive from the query string, so every value is compared as
- * text against the `attributes_text` column rather than against typed JSON.
+ * text: `attributes ->> key` renders the stored JSON value as text, whatever
+ * type it was ingested as.
  */
 export type AttributeFilters = Record<string, string>;
 

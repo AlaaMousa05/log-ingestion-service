@@ -1,6 +1,6 @@
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { db } from "../src/db/index.js";
-import { logs } from "../src/db/schema.js";
+import { logs, logsRollup } from "../src/db/schema.js";
 import { insertLogs } from "../src/repositories/logs.repository.js";
 import { buildApp } from "../src/server/app.js";
 import type { LogEntry } from "../src/types/log.types.js";
@@ -24,13 +24,15 @@ async function getJson<T>(url: string) {
   return { response, body: response.json() as T };
 }
 
-beforeAll(async () => {
+/** Clears the derived rollup alongside `logs` — see tests/logs.repository.test.ts. */
+async function resetLogs() {
   await db.delete(logs);
-});
+  await db.delete(logsRollup);
+}
 
-beforeEach(async () => {
-  await db.delete(logs);
-});
+beforeAll(resetLogs);
+
+beforeEach(resetLogs);
 
 describe("HTTP contract", () => {
   it("reports health when PostgreSQL is reachable", async () => {

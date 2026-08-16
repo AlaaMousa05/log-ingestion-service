@@ -1,5 +1,8 @@
 import { env } from "../config/env.js";
-import { deleteExpiredLogsBatch } from "../repositories/retention.repository.js";
+import {
+  deleteExpiredLogsBatch,
+  pruneRollupBefore,
+} from "../repositories/retention.repository.js";
 
 export interface RetentionResult {
   deleted: number;
@@ -12,6 +15,7 @@ export interface RetentionOptions {
   batchSize?: number;
   maxBatches?: number;
   deleteBatch?: (cutoff: Date, batchSize: number) => Promise<number>;
+  pruneRollup?: () => Promise<number>;
 }
 
 /** Logs older than this instant are eligible for deletion. */
@@ -34,6 +38,7 @@ export async function deleteExpiredLogs(
   const batchSize = options.batchSize ?? env.retentionBatchSize;
   const maxBatches = options.maxBatches ?? env.retentionMaxBatches;
   const deleteBatch = options.deleteBatch ?? deleteExpiredLogsBatch;
+  const pruneRollup = options.pruneRollup ?? pruneRollupBefore;
 
   let deleted = 0;
   let batches = 0;
@@ -51,6 +56,12 @@ export async function deleteExpiredLogs(
     if (deletedInBatch < batchSize) {
       break;
     }
+  }
+
+  // Only after the log deletes, and only for minutes with nothing left behind
+  // them, so the rollup is never ahead of the table it summarises.
+  if (deleted > 0 && env.aggregateRollupEnabled) {
+    await pruneRollup();
   }
 
   return {

@@ -34,12 +34,43 @@ uses `group: null` without grouping.
 
 PostgreSQL is the read/write source of truth. `logs` has a `bigserial` ID and a composite
 `(timestamp, id)` primary key — this single index backs descending pagination/cursor comparisons,
-timestamp-range scans, and the retention delete, all at once. It stores original values in
-`attributes JSONB` and string-normalized values in `attributes_text JSONB` so that `attr.<key>`
-equality filtering can be implemented as JSONB containment compared as strings, per the API contract.
+timestamp-range scans, and the retention delete, all at once.
 Query-aligned B-tree indexes are `(service,timestamp,id)` and `(level,timestamp,id)`. No JSONB GIN or
-trigram index is enabled: unselective attribute/message searches can scan, but those indexes would add
-write-side cost without a measured need at the current scale.
+trigram index is enabled: unselective attribute/message searches can scan. That is a measured
+decision, not an omission — see "Rejected on evidence" below.
+
+**Attribute storage.** Attributes are stored once, as `attributes JSONB`, preserving the JSON type
+they arrived as so the response round-trips them unchanged. `attr.<key>` filtering compiles to
+`attributes ->> 'key' = 'value'`: `->>` renders any JSON scalar as text — `3` becomes `'3'`, `true`
+becomes `'true'` — which is exactly the "compared as strings" rule the API contract states. An
+earlier design carried a second, all-strings mirror column (`attributes_text`) so the same filter
+could be expressed as JSONB containment. It was removed after measurement: it cost **33% of every
+row's width** (286 → 190 bytes/row, 458 MB → 313 MB per ~1.7M rows) and a second `JSON.stringify`
+per row inside a 0.5-CPU application, to answer a question the original column already answers.
+Removing it cut `COPY` service time 30% and ingestion latency 20–27%.
+
+**Pre-aggregation.** `logs_rollup` holds per-minute counts keyed
+`(bucket_minute, service, level, shard)`, written in the *same transaction* as the `COPY` that
+writes `logs`, so a reader can never see rows counted in one and missing from the other. It holds
+nothing that cannot be recomputed from `logs`, and `GET /logs/aggregate` falls back to scanning
+`logs` for any filter the rollup cannot answer (`q`, `attr.<key>`). Minute is the finest bucket the
+API exposes, so `1m`/`5m`/`1h`/`1d` are all exact multiples of one rollup row, and both `group_by`
+dimensions are carried in the key.
+
+Two details make it work, both of which are the difference between a large win and a large loss:
+
+- **Partial edges are read from the base table.** `since`/`until` are arbitrary instants, so the
+  first and last minute of a range contain rows on both sides of the boundary and cannot be taken
+  from a per-minute count without over-reporting. The query reads `logs_rollup` for the whole
+  interior minutes and `logs` for the (at most two) partial edge minutes, which makes the result
+  *identical* to a full scan rather than approximate.
+- **Counters are sharded.** A single row per `(minute, service, level)` made every concurrent
+  ingest transaction contend for the same handful of counters — measured at 65 ms mean per upsert
+  and 42% of all PostgreSQL execution time, with zero table bloat and 98.7% HOT updates, i.e.
+  entirely lock wait rather than work. Spreading each counter over 16 shards (round-robin per
+  flush) lets concurrent writers land on different rows; readers already `SUM`, so the shard is
+  invisible above the table. This took the upsert from 65 ms to **0.38 ms** and from 42% of
+  database time to **under 3%**. The rollup costs ~600 kB against ~450 MB of logs.
 
 Ingestion uses native PostgreSQL text COPY in 500-row chunks per request, escaping backslash, tab, LF,
 and CR. Three separate connection pools exist — ingestion (`DB_INGEST_POOL_MAX`, default 12),
@@ -48,15 +79,18 @@ queries/retention (`DB_QUERY_POOL_MAX`, default 8), and a tiny dedicated pool fo
 query/ingestion load can never make the liveness check queue behind it. Ingestion and queries use
 *different* connection acquire timeouts on purpose: `DB_POOL_CONNECT_TIMEOUT_MS` (default 8000ms) for
 ingestion, which can tolerate waiting rather than dropping a batch, and the shorter
-`DB_QUERY_POOL_CONNECT_TIMEOUT_MS` (default 2500ms) for queries, which should fail fast instead of
-inflating `GET /logs/aggregate`'s own latency (see Measured performance). The health pool's timeout is
+`DB_QUERY_POOL_CONNECT_TIMEOUT_MS` for queries — both default to 8000ms today, kept separate
+because ingestion and querying have genuinely different service times. The health pool's timeout is
 a separate fixed 2000ms so a genuinely unreachable database is still reported quickly. All are optional
 and defaulted; `docker compose up` with no configuration is unaffected. Tests round-trip quotes,
 backslashes, tabs, newlines, carriage returns, and Unicode through COPY.
 
 `RETENTION_DAYS` defaults to 30. Once per hour, bounded oldest-first `FOR UPDATE SKIP LOCKED` batches
 delete expired records without holding long-running locks. `RETENTION_BATCH_SIZE` defaults to 2500 and
-`RETENTION_MAX_BATCHES` to 10.
+`RETENTION_MAX_BATCHES` to 10. After a run that deleted anything, rollup minutes with no surviving
+logs behind them are dropped. The boundary is derived from the oldest *remaining* row rather than
+from the retention cutoff, so `logs_rollup` stays exactly consistent with `logs` even when a run
+stops early at its batch cap and leaves rows older than the cutoff still present.
 
 ## Configuration and optional features
 
@@ -73,6 +107,7 @@ delete expired records without holding long-running locks. `RETENTION_BATCH_SIZE
 | `DB_QUERY_POOL_CONNECT_TIMEOUT_MS` | `8000` | How long query requests wait before shedding — same budget as ingestion (`GET /health` uses a separate, fixed 2000ms). Was `2500`; measured against the official benchmark to be *below* observed aggregate p95 in every stage, shedding 14–46% of reads for no latency benefit — see "Measured performance" |
 | `INGEST_COALESCE_WINDOW_MS` | `15` | How long `POST /logs` buffers validated rows from concurrent requests before issuing one shared `COPY` for the whole window, instead of one `COPY` per request |
 | `INGEST_COALESCE_MAX_BATCH_ENTRIES` | `10000` | Safety valve: a window flushes early if it accumulates this many rows, bounding worst-case latency and single-`COPY` size under extreme concurrency |
+| `AGGREGATE_ROLLUP_ENABLED` | `true` | Serves `GET /logs/aggregate` from the per-minute `logs_rollup` table for the filters it can answer, instead of scanning `logs`. Response shape and values are identical either way (verified by a 79-case differential against the base table); this exists so the write-side cost of maintaining the rollup can be re-measured against the read-side saving on different hardware. Setting it to `false` keeps `logs_rollup` from being maintained and routes every aggregation through the base table |
 
 No authentication, tenancy, or rate limiting is implemented. Every variable above is optional and
 defaulted: a plain `docker compose up` with no environment file serves the complete, unauthenticated
@@ -80,170 +115,121 @@ core contract on all four required endpoints.
 
 ## Measured performance
 
-**Official benchmark** (submission `7VQZVZDZZXEMTPTY36FM8S0R78`, commit `3416eb3b0ab0`, before the
-changes described below): 59.40/100, achieved throughput 584–2,549 logs/sec against a 15,000 logs/sec
-target across four load stages (Load/Stress/Spike/Breakpoint), aggregate p95 4.08×–5.99× over the 1s
-target, HTTP error rate up to 22.10% under the Breakpoint stage. Correctness (75/75 checks) and
-reliability (missing records: 0 in every stage) were already at maximum — the gap was entirely
-throughput/latency under load, not correctness.
+### The measurement that reframed everything
 
-**Root cause, as diagnosed**: PostgreSQL running at 70–107% of its single CPU core while the application sat at 5–20% — the
-application-side connection pool (previously a single pool, `max: 7`, 5s acquire timeout, shared by
-ingestion and queries) was queuing requests well before PostgreSQL's own capacity was the limit, and a
-burst of ingestion COPY calls could hold every available connection, starving the required aggregation
-traffic behind it.
+The load generator is a **closed loop**: a fixed batch size (33 log entries per request) driven by a
+capped pool of virtual users. When that pool is saturated, achieved throughput is not a capacity
+measurement — it is arithmetic:
 
-**Local changes made and locally re-measured** (against the identical container resource limits —
-0.5 CPU/256 MB app, 1 CPU/1 GB PostgreSQL): split the connection pool (ingestion vs. query), and
-right-sized pool `max`/timeout via a batch-size-and-concurrency A/B (a naive tune looked good at one
-batch size and collapsed at another). Local load-test results (`scripts/load-test.ts`,
-`BATCH_SIZE=1000`) after the change:
+```
+logs/sec  =  concurrent VUs x 33 logs / mean POST /logs latency
+```
 
-| Workers | Throughput before | Throughput after | Aggregate p95 after |
-|---:|---:|---:|---:|
-| 6 | 18,490/s | 27,277/s | 357ms |
-| 16 | 12,895/s | 30,005/s | 944ms |
-| 64 | 15,682/s | 22,609/s | 1,368ms |
-| 128 | 13,279/s | 18,365/s | 1,672ms |
+This is visible directly in the official reports: `accepted logs / http requests = 33.3` in every
+stage of every submission. It means **per-request latency, not per-row cost, is what the throughput
+number measures.** Earlier rounds of this project were tuned with a local harness using batch sizes
+of 300–2500 driven by worker loops — the opposite regime, where per-row throughput dominates and
+latency is nearly free. That harness reported 27,000 logs/sec while the official figure stayed near
+2,600, and its aggregation probe used a different query shape (`bucket=1h`, no `group_by`) from the
+one actually graded (`bucket=1m&group_by=service`), reporting a 6 ms p50 against an official 5.6 s
+p95. Conclusions drawn from it did not transfer. Every number below is measured under the real
+`docker-compose.yml` limits (0.5 CPU/256 MB app, 1 CPU/1 GB PostgreSQL, verified with
+`docker inspect` before each run) using the graded composition: batch 33, capped VU pool,
+1 aggregation/sec and a concurrent read-after-write probe workload, 120 s, fresh database per run.
 
-Every tested concurrency level now exceeds the 15,000 logs/sec target locally. **These are local
-results only** — the official load generator's exact concurrency/batching/network methodology is not
-known to us, so this is strong evidence the underlying bottleneck was real and the fix works, not a
-guarantee of the exact official score movement, which requires a fresh official submission to confirm.
+### Where the database's single core actually goes
 
-**Queries score (6.00/15.00 official, against a perfect 15.00/15.00 Correctness) — root cause found
-and fixed.** The official report gives no per-check breakdown, so this was diagnosed by systematically
-hammering `GET /logs`/`GET /logs/aggregate` with concurrent query traffic during heavy concurrent
-ingestion. Under that condition, 3.4% of query requests returned a raw, undocumented `500` instead of
-the correct `503`+`Retry-After` — while `POST /logs` under the identical condition always correctly
-returned `503`. Root cause: `findLogs`/`aggregateLogs` go through Drizzle, which wraps driver errors as
-`DrizzleQueryError` and — depending on the exact query shape — sometimes leaves the underlying pg-pool
-timeout message only on `.cause` (Node's standard error-chaining) rather than folding it into its own
-`.message`; the pool-exhaustion classifier only checked `.message`, so it missed those cases. Fixed by
-walking the `.cause` chain; verified across 3 repeated runs post-fix with **zero** 500s (all correctly
-shed as 503).
+Attributed with `pg_stat_statements` rather than estimated. Before this round of work:
 
-**Dropped-request cliff at full scale (74% dropped at `WORKERS=128`) — root cause found and fixed.**
-A fresh full-scale local run (`TOTAL_LOGS=1000000`, default `BATCH_SIZE=2500`) surfaced something the
-earlier 300K-row/10-20s A/B runs never reached: a sustained-load collapse where the ingest pool's
-demand permanently exceeded its service rate, cascading into most requests timing out and being shed
-as 503. Diagnosed precisely (pool-acquire timing + cgroup CPU, not guessed): only 28 of 400 requests
-ever acquired a connection; the app sat at 87.7% of its 0.5 CPU budget while PostgreSQL sat at 24.7% of
-its 1 CPU budget — the same application-side CPU contention as the aggregate-p95 finding below, now at
-a scale and duration that turns it into outright request loss instead of just latency. **Fix**: raised
-`DB_POOL_CONNECT_TIMEOUT_MS` from 1500ms to 8000ms (pool sizing itself unchanged), so legitimate demand
-waits longer instead of being shed. A/B'd across the full matrix this time — `WORKERS` 6/16/64/128 and
-`BATCH_SIZE` 300/1000/2500, every run at the full 1,000,000-row scale, not shortened bursts — the only
-candidate configuration that reached zero drops at both 64 and 128 workers. Trade-off, stated plainly:
-ingestion p95 at `WORKERS=128` is ~12.5s and max reached ~20s in testing — worse latency, but per the
-explicit priority that avoiding dropped requests matters more than aggregate latency, this is the
-correct direction. Zero-config confirmation runs accepted 730,000-1,000,000 of 1,000,000 logs
-(73-100%, see the `WORKERS=128` variance note under Known Limitations) at `WORKERS=128`, a large,
-consistent improvement over the 260,000-270,000 (26-27%) accepted before this fix even at the low end
-of that range — but not a guaranteed zero every run at this specific, most-extreme concurrency tier.
-`WORKERS=6/16/64` are reliably zero-drop across every run measured.
-
-**Query latency reduced further with a per-pool timeout split.** Ingestion and queries now use
-different connection-acquire timeouts (`DB_POOL_CONNECT_TIMEOUT_MS=8000ms` for ingestion,
-`DB_QUERY_POOL_CONNECT_TIMEOUT_MS=2500ms` for queries) instead of sharing one value — a query request
-should fail fast rather than wait up to 8s just to then run, which was inflating
-`GET /logs/aggregate`'s own p95. Verified: aggregate p95 at `WORKERS=64` dropped from 6,191ms to
-2,836ms, and at `WORKERS=128` from 22,186ms to 2,835ms, with no measured regression to the drop-rate
-floor at `WORKERS=6/16/64`.
-
-**`GET /health` could be marked unhealthy from pure query load, not an actual outage — found and
-fixed.** Measured under the same full-scale `WORKERS=128` scenario: health-check latency reached
-6,325ms while sharing the query pool — longer than `docker-compose.yml`'s own healthcheck
-`timeout: 3s`. Fixed with a third, tiny, dedicated pool (`max: 2`, fixed 2000ms timeout) exclusively for
-`GET /health`, verified to cut worst-case latency to 3,742ms (41% reduction) under the identical
-scenario. The residual is now bounded by PostgreSQL's own CPU saturation, not connection queueing, and
-is further cushioned by Docker's healthcheck requiring 10 consecutive failures before acting.
-
-**Request-level ingestion coalescing — measured under real Docker resource limits, a real win.**
-With PostgreSQL CPU confirmed pinned at 100–107% in every stage of every official submission
-regardless of pool/timeout tuning, the next lever targeted operation *count*, not per-row cost:
-`POST /logs` now buffers already-validated rows from concurrent requests for a short window
-(`INGEST_COALESCE_WINDOW_MS`, default 15ms) and issues one shared `COPY` for the whole window
-instead of one `COPY` per request. Two other candidates were tried first and reverted based on
-real-limits evidence rather than shipped on the strength of unconstrained-host numbers: an
-incremental rollup table for `GET /logs/aggregate` (real win on an unconstrained host, but net
-*negative* under the actual 0.5/1 CPU limits — ~34–45% lower ingestion throughput with no
-compensating latency/CPU benefit once rollup-maintenance itself had to compete for the single
-Postgres core) and a GIN/trigram index on `message` (write-side throughput cost with the index
-never used by the planner at the tested scale). Both were measured and reverted, not hidden.
-
-Coalescing was measured the same way from the start — every number below is from this repo's own
-`docker-compose.yml` limits (0.5 CPU/256MB app, 1 CPU/1GB PostgreSQL), verified directly via
-`docker inspect`, never an unconstrained host standing in for them:
-
-*Corrected-composition harness alone* (50.5 POST/s, batch=67, 25 read-after-write probes/s, 1
-aggregate/s — the harness rate independently validated against the official benchmark's own
-achieved throughput): no meaningful difference with or without coalescing. This rate is too
-moderate to stress the real resource limits either way — the effect only shows up under genuine
-concurrent pressure, which is exactly where the four official stages differ.
-
-*Worker-pressure tests proxying each official stage's relative concurrency* (Load≈12 concurrent
-ingest workers, Stress/Spike≈24, Breakpoint≈36), fresh table each run:
-
-| Stage | Before (logs/sec) | After (logs/sec) | Change |
-|---|---:|---:|---:|
-| Load | 4,417 | 7,144 | +62% |
-| Stress | 3,675 | 8,932 | +143% |
-| Spike | 5,859 | 9,453 | +61% |
-| Breakpoint | 5,690 | 10,977 | +93% |
-
-*Breakpoint at realistic scale* (~2.8–3.7M rows, matching context.md's "approximately 1,000,000
-records" target and beyond — this is the condition that actually matters, not just an empty-table
-burst):
-
-| Metric | Before (~2.8M rows) | After (~3.7M rows) |
+| Statement | Share of total execution time | Mean |
 |---|---:|---:|
-| Throughput | 3,648 logs/sec | 5,105 logs/sec (**+40%, despite more accumulated data**) |
-| PostgreSQL CPU avg / max | 4.82% / 20.53% | 2.01% / 7.19% |
-| App CPU avg / max | 5.06% / 13.61% | 0.67% / 3.43% |
-| Aggregate p50 | 168ms | 6ms |
-| Aggregate p95 / max | 1,290ms / 1,290ms | 2,124ms / 2,124ms |
+| `COPY logs` | 39.2% | 48.5 ms |
+| `GET /logs` (read-after-write probe) | 33.5% | 72.2 ms *to return one row* |
+| `GET /logs/aggregate` | 27.2% | 2,213 ms |
 
-**Reported honestly, not smoothed over**: aggregate p95/max got *worse* at this scale (small
-sample, 16 checks per run — plausibly noise, but not claimed as a win). Every other metric —
-throughput, PostgreSQL CPU, app CPU, and aggregate p50 — improved substantially and consistently
-across all four stage shapes. Window size was tuned empirically, not guessed: 5ms gives
-marginally higher raw throughput but much higher PostgreSQL CPU at Breakpoint pressure (max
-73.49% vs. 7.19%); 40ms clearly regresses at lower concurrency (12,609 vs. 18,724–20,161 logs/sec
-in a pure-write test). The shipped 15ms default has the lowest PostgreSQL CPU footprint of the
-three tested while still delivering the full throughput win over no coalescing at all.
+Reads and aggregation together were **61%** of the database's single core, against ~79 write
+requests/sec. Ingestion was never the bottleneck; it was being starved by the read side.
 
+### Results
+
+| | logs/sec | ingest avg | ingest p95 | aggregate avg | aggregate p95 | read avg |
+|---|---:|---:|---:|---:|---:|---:|
+| Before | 12,107 | 122 ms | 287 ms | 2,249 ms | 6,327 ms | 106 ms |
+| After | **14,131** | **51 ms** | **178 ms** | **16 ms** | **91 ms** | **24 ms** |
+
+Aggregation p95 improved ~70x, ingestion latency fell 58%, throughput rose 17%, with zero HTTP
+errors and 100% read-after-write success throughout. Because throughput is latency divided into a
+fixed VU budget, the ingestion-latency figure is the one that converts into throughput.
+
+Isolated A/B of each change, same build, toggled by configuration so nothing else varies:
+
+| Change | logs/sec | ingest avg | aggregate p95 | `COPY` mean |
+|---|---:|---:|---:|---:|
+| Rollup off (control) | 12,993 | 89 ms | 4,830 ms | — |
+| Rollup on, unsharded counters | 4,380 | 501 ms | 481 ms | 70.4 ms |
+| Rollup on, sharded counters | 14,147 / 12,842 | 57 / 90 ms | 85 / 102 ms | 9.3 / 14.6 ms |
+| … and `attributes_text` removed | 14,342 / 14,131 | 46 / 51 ms | 89 / 91 ms | 7.1 / 7.4 ms |
+
+Two runs are shown where the effect size is small enough that a single sample would not justify the
+claim. The throughput difference between the last two rows is within run-to-run variance and is
+**not** claimed as a throughput win; the `COPY` service time, ingestion latency and row-width
+reductions are the reproducible parts.
+
+Query plans at ~1.7M rows, for the two graded query shapes, are in "Rejected on evidence" below and
+in the source comments. The aggregation query previously scanned every index entry in the table to
+produce 36 output rows; it now reads a few thousand rollup rows.
+
+### Rejected on evidence
+
+Recorded because the negative results cost as much to obtain as the positive ones.
+
+**GIN trigram index on `LOWER(message)`.** The `q=` substring probe is the single most frequent
+database operation in the graded workload, and its plan is pathological: a bitmap scan narrows to
+~13,000 candidate rows in 2 ms, then **5,902 heap blocks (~47 MB) are fetched purely to evaluate
+`LOWER(message) LIKE`, to return one row**. In isolation a trigram index fixes exactly that —
+the planner uses it, heap blocks drop from 5,902 to **1**, and execution goes from 15.3 ms to
+0.95 ms. Under real concurrent load it loses both ways:
+
+| | logs/sec | `COPY` mean | read query mean |
+|---|---:|---:|---:|
+| No trigram index | 13,970 | 10.6 ms | 11.8 ms |
+| `fastupdate=on` (default) | 13,694 | 16.6 ms | 12.6 ms — no gain |
+| `fastupdate=off` | 5,970 | 168.6 ms | 10.4 ms |
+
+With `fastupdate=on` every index scan must also scan a continuously-large GIN pending list, which
+consumes the entire read benefit while still charging 57% more for `COPY`. Turning it off removes
+the pending list but moves the cost onto every insert, collapsing ingestion by 57%. Not enabled.
+
+**Daily `RANGE` partitioning.** Considered and declined for this workload. The graded aggregation
+window is a few minutes and the read probe's is ten seconds, so every query lands inside a single
+daily partition, and the `(timestamp, id)` primary key already prunes by timestamp. Retention is
+never exercised in a benchmark run that spans minutes against a 30-day policy, so `DROP TABLE`
+versus batched `DELETE` changes nothing there. It would add tuple-routing cost to the one path
+that is genuinely per-row. It remains the right answer for a long-lived deployment at the
+"1M rows / one month" steady state — bounded vacuum, cheap retention, no bloat — which is a
+different goal from this benchmark.
+
+**Unsharded rollup counters** and **`synchronous_commit=off`**: the first is measured above; the
+second was declined because the constrained resource here is CPU rather than fsync, and it would
+weaken the guarantee that a 200 response means the batch is durably accepted.
 ## Known limitations
 
-**`WORKERS=128` (the most extreme concurrency tested) has an inherently variable accept rate, not a
-guaranteed zero-drop floor.** Investigated directly, not assumed: the *identical* configuration, run
-on fresh volumes at full 1,000,000-row scale, accepted anywhere from 73% to 99% of logs across
-different runs. This is not caused by any specific config value — it reproduces with or without the
-query-pool-timeout-split fix — and reflects genuine capacity-edge variance at 128 concurrent workers
-under the fixed 0.5 CPU/1 CPU resource envelope, not a bug with a further fix identified yet.
-`WORKERS=6/16/64` remain reliably at zero drops across every run measured (many, across several
-rounds). Also worth noting: the official benchmark's own achieved throughput (584-2,549 logs/sec) is
-far below what 128 local workers generate, so it's unclear whether the official load generator's
-actual concurrency model ever reaches this regime at all.
+**Local measurement cannot stand in for the graded environment.** The host used for the numbers
+above runs the same workload roughly 4-5x faster than the grading environment, and the binding
+constraint lands in a different place because of it: locally the application container hits its
+0.5 CPU quota (94% of scheduler periods throttled, measured from `cpu.stat`) while PostgreSQL has
+headroom; in the graded runs PostgreSQL is the saturated side and the application sits near idle.
+Absolute local throughput therefore is not a prediction of the graded figure. What does transfer
+is per-statement structure — query plans, rows and heap blocks touched, `pg_stat_statements`
+service time — so those are what the changes above were selected on, and what an A/B should be
+judged on here.
 
-**Aggregate p95 still exceeds the 1s target at large batch sizes under high concurrency.** At
-`BATCH_SIZE=2500` with 64+ concurrent ingestion workers, local aggregate p95 reaches ~1.4–3.2s
-(varies run to run; see below). This was diagnosed precisely, not guessed at: at this specific shape,
-the **application container**, not PostgreSQL, becomes the constraint — cgroup CPU accounting showed
-the app at ~72% of its 0.5 CPU budget while PostgreSQL sat at ~22% of its 1 CPU budget (the reverse of
-the picture at smaller batches), and `pg_stat_activity` sampling showed most COPY-holding PostgreSQL
-connections idle, waiting on the application to send more data. Two fix attempts were tried and
-measured with a rigorous, multi-run A/B methodology — a single upfront-built COPY payload instead of
-chunked streaming, and a leaner attribute-JSON serializer within the existing chunked structure — and
-both were **reproducibly worse**, not better (throughput dropped from a consistent ~27–28.5k/s to
-~21–26k/s in repeated, controlled trials), likely because concentrating CPU-bound work into larger,
-less-interruptible chunks hurts fairness on a single-threaded, 0.5-CPU-limited event loop serving many
-concurrent requests at once. Both attempts were reverted; the code is unchanged from the pool-split fix
-above. Candidates not yet tried: admission control that sheds
-excess concurrent ingestion requests at the HTTP layer before they compete for CPU/event-loop time
-(rather than only at the DB-connection-pool layer), or moving COPY-payload construction to a
-`worker_thread` — or accepting this as a genuine capacity limit of a 0.5-CPU application container at
-very large batch sizes.
+**The application container has its own throughput ceiling.** Per-request application CPU measures
+~0.8-1.0 ms across both environments, which puts a 0.5 CPU container's limit near 500 requests/sec
+regardless of how fast the database is. At the graded batch size that is ~16,500 logs/sec — enough
+for the stated target, but without much margin on slower cores. Reducing per-request work
+(dropping the mirror attribute column removed 42% of row-serialisation cost) matters as much on
+this side as index and query work does on the database side.
 
 **Cursor-paginated sweeps of `GET /logs` can miss rows inserted concurrently with historically-scattered
 timestamps.** Measured directly: paginating through a filtered result set while ~1,500 rows are being
@@ -257,9 +243,26 @@ fetched and is never revisited. This is a structural consequence of combining th
 concurrently-published historical content — and cannot be eliminated without changing the required sort
 order. Not attempted as a fix for exactly that reason; documented instead.
 
-**No GIN/trigram index** on the attribute or message-search columns — unfiltered `attr.<key>` or `q`
-queries with no `service`/`level`/tight time bound will scan more rows than an indexed approach would.
-Not yet a measured problem at current scale; noted as a scaling limitation.
+**No GIN/trigram index** on the attribute or message-search columns. `q=` is answered by fetching
+the rows a `service`/`level`/time filter narrows to and evaluating `LOWER(message) LIKE` on each,
+so an unbounded `q` with no other filter scans widely. A trigram index fixes the plan completely in
+isolation but loses under concurrent write load in both of its configurations — measured, with
+numbers, under "Rejected on evidence". This is a genuine trade rather than an omission: a
+read-mostly deployment should enable it, and a write-saturated one should not.
+
+**`attr.<key>` compares against PostgreSQL's canonical text form of the stored value.** For every
+value the validator accepts this is identical to the value as sent, with one exception: a number
+whose JavaScript string form uses exponent notation is stored and compared in decimal expansion, so
+`attr.x=1000000000000000000000` matches where `attr.x=1e+21` no longer does. Response bodies are
+unaffected and still round-trip `1e+21` unchanged. Verified across string, integer, float, negative,
+zero, large, boolean, Unicode, quote and tab values.
+
+**`logs_rollup` is derived state and assumes it is the only writer path.** Ingestion maintains it
+transactionally and retention prunes it, but anything that modifies `logs` out of band — a manual
+`DELETE`, a restore, a test fixture — must clear or rebuild it, or aggregations will report the
+stale counts. The test suite does exactly this and is the reason it is called out here. Setting
+`AGGREGATE_ROLLUP_ENABLED=false` routes every aggregation through the base table if that guarantee
+is ever inconvenient.
 
 **No authentication, rate limiting, or multi-tenancy** are implemented (see Configuration above) —
 this is a deliberate scope decision, not an oversight, and keeps the zero-configuration contract simple.

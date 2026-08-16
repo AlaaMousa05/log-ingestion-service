@@ -45,8 +45,34 @@ function getLogLevel(value: string | undefined): PinoLogLevel {
   return value as PinoLogLevel;
 }
 
+function getBoolean(name: string, value: string | undefined, fallback: boolean): boolean {
+  if (value === undefined || value === "") {
+    return fallback;
+  }
+
+  if (value !== "true" && value !== "false") {
+    throw new Error(`${name} must be 'true' or 'false'`);
+  }
+
+  return value === "true";
+}
+
 export const env = {
   logLevel: getLogLevel(process.env.LOG_LEVEL),
+
+  // Serves GET /logs/aggregate from the per-minute `logs_rollup` table instead
+  // of scanning `logs`, for the filters the rollup can answer (see
+  // src/repositories/logs.repository.ts). Measured directly against the
+  // benchmark's own aggregate query -- a full scan of ~1.5M rows to produce 36
+  // output rows costs ~490ms on an idle database and 2.2s under concurrent
+  // ingestion, and that single query is ~27% of all PostgreSQL execution time.
+  // Kept switchable so the ingestion-side cost of maintaining it can be
+  // re-measured against the read-side saving on different hardware.
+  aggregateRollupEnabled: getBoolean(
+    "AGGREGATE_ROLLUP_ENABLED",
+    process.env.AGGREGATE_ROLLUP_ENABLED,
+    true,
+  ),
 
   port: getPositiveInteger(
     "PORT",
