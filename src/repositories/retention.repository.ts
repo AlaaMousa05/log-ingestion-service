@@ -1,5 +1,6 @@
 import { sql } from "drizzle-orm";
 import { db } from "../db/index.js";
+import { env } from "../config/env.js";
 
 /**
  * Deletes one bounded oldest-first batch and returns only its count.
@@ -42,12 +43,20 @@ export async function deleteExpiredLogsBatch(
 }
 
 /**
- * Drops rollup minutes that no longer have any logs behind them.
+ * Drops rollup buckets that no longer have any logs behind them.
  *
  * Deriving the boundary from the oldest surviving row — rather than from the
  * retention cutoff — keeps `logs_rollup` exactly consistent with `logs` even
  * when a retention run stops early at its batch cap, leaving rows older than
  * the cutoff still present.
+ *
+ * The bucket width has to match `env.rollupBucketSeconds` (see
+ * `src/repositories/logs.repository.ts`), not be hardcoded to a minute:
+ * `date_bin` with the wrong width would round the oldest surviving row's
+ * bucket down to a boundary the rollup itself never wrote, either pruning a
+ * bucket that still has real data behind it (undercounting the next
+ * aggregate that needs it) or leaving one behind for one extra cycle
+ * (harmless, but not what "exactly consistent" is supposed to mean here).
  */
 export async function pruneRollupBefore(): Promise<number> {
   const result = await db.execute(
@@ -55,7 +64,7 @@ export async function pruneRollupBefore(): Promise<number> {
       DELETE FROM logs_rollup
       WHERE bucket_minute < (
         SELECT COALESCE(
-          date_bin('1 minute', min(timestamp), TIMESTAMPTZ '2026-01-01 00:00:00+00'),
+          date_bin(${sql.raw(`'${env.rollupBucketSeconds} seconds'`)}, min(timestamp), TIMESTAMPTZ '2026-01-01 00:00:00+00'),
           'infinity'::timestamptz
         )
         FROM logs

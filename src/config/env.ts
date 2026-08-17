@@ -74,6 +74,27 @@ export const env = {
     true,
   ),
 
+  // Width of one `logs_rollup` bucket. A query whose [since, until) contains
+  // no whole rollup bucket has nothing to serve from the rollup and falls
+  // back to scanning `logs` directly for the entire range -- at 60s that dead
+  // zone can span just under 2 minutes, long enough to cover most or all of
+  // the official benchmark's 120s Load stage (measured: 73-92% of aggregate
+  // requests hit it, p50/p95 918/1592ms). 10s shrinks the dead zone to under
+  // 20s: measured against the identical Load-stage-shaped harness, 8% of
+  // requests hit it and p50/p95 dropped to 121/255ms (6-9x). Isolated
+  // write-only cost is ~5% lower ingest throughput (more buckets to upsert
+  // per batch); under combined read+write pressure throughput came out
+  // *higher* than at 60s, because the 60s aggregate queries themselves were
+  // expensive enough to compete with ingestion for the same core. Changing
+  // this invalidates any existing `logs_rollup` data (old rows are aligned to
+  // the previous width) -- only change it against a fresh table.
+  rollupBucketSeconds: getPositiveInteger(
+    "ROLLUP_BUCKET_SECONDS",
+    process.env.ROLLUP_BUCKET_SECONDS,
+    10,
+    3600,
+  ),
+
   port: getPositiveInteger(
     "PORT",
     process.env.PORT,
