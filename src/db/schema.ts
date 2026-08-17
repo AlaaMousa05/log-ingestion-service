@@ -33,11 +33,7 @@ export const logs = pgTable(
       .notNull(),
   },
   (table) => [
-    // Composite primary key: also backs descending pagination/cursor comparisons and the
-    // retention delete's timestamp range scan (see src/repositories/*.ts).
     primaryKey({ columns: [table.timestamp, table.id] }),
-
-    // Query-aligned composite indexes for the two single-dimension filters.
     index("idx_logs_service_timestamp_id").on(
       table.service,
       table.timestamp,
@@ -51,30 +47,12 @@ export const logs = pgTable(
   ]
 );
 
-/**
- * Pre-aggregated per-minute counts, maintained in the same transaction as the
- * COPY that writes `logs` (see src/repositories/logs.repository.ts), so the two
- * are never observably out of step.
- *
- * `logs` remains the sole source of truth: this table holds nothing that cannot
- * be recomputed from it, and GET /logs/aggregate falls back to scanning `logs`
- * for any filter the rollup cannot answer (message substring, attributes) and
- * for the partial minutes at either edge of the requested range.
- *
- * Minute is the finest bucket the API exposes, so every supported bucket size
- * (1m/5m/1h/1d) is an exact multiple of one rollup row. Grouping by service and
- * by level are both supported because the key carries both dimensions.
- */
 export const logsRollup = pgTable(
   "logs_rollup",
   {
     bucketMinute: timestamp("bucket_minute", { withTimezone: true }).notNull(),
     service: text("service").notNull(),
     level: logLevelEnum("level").notNull(),
-    // Counter shard. A single row per (minute, service, level) made every
-    // concurrent ingest transaction contend for the same handful of counters;
-    // spreading them lets concurrent writers land on different rows. Readers
-    // always SUM, so the shard is invisible above this table.
     shard: smallint("shard").notNull(),
     count: bigint("count", { mode: "number" }).notNull(),
   },
