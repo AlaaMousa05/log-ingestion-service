@@ -91,7 +91,7 @@ export const env = {
   rollupBucketSeconds: getPositiveInteger(
     "ROLLUP_BUCKET_SECONDS",
     process.env.ROLLUP_BUCKET_SECONDS,
-    10,
+    5,
     3600,
   ),
 
