@@ -37,7 +37,7 @@ PostgreSQL is the read/write source of truth. `logs` has a `bigserial` ID and a 
 timestamp-range scans, and the retention delete, all at once.
 Query-aligned B-tree indexes are `(service,timestamp,id)` and `(level,timestamp,id)`. No JSONB GIN or
 trigram index is enabled: unselective attribute/message searches can scan. That is a measured
-decision, not an omission — see "Rejected on evidence" below.
+decision, not an omission — see "Rejected on evidence" below
 
 **Attribute storage.** Attributes are stored once, as `attributes JSONB`, preserving the JSON type
 they arrived as so the response round-trips them unchanged. `attr.<key>` filtering compiles to
