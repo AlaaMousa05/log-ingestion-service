@@ -33,8 +33,7 @@ process.once("SIGINT", () => void shutdown("SIGINT"));
 try {
   await db.execute(sql`SELECT 1`);
 
-  // Apply migrations programmatically before listening for requests, so /health can never
-  // report ready until the schema is up to date.
+  // Migrations run before listen, so /health never reports stale.
   app.log.info("Applying database migrations...");
   await migrate(db, { migrationsFolder: "./src/db/migrations" });
   app.log.info("Database migrations applied successfully.");

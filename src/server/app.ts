@@ -3,12 +3,7 @@ import { registerRoutes } from "./routes.js";
 import { ingestPool, queryPool, healthPool } from "../db/index.js";
 import { env } from "../config/env.js";
 
-// node-postgres (pg-pool) throws these exact message patterns when the
-// connection pool cannot hand out a client — either because our own pool's
-// `max` is fully checked out (client-side connectionTimeoutMillis) or
-// because Postgres itself is refusing new connections server-side. These
-// are transient overload conditions, not application bugs, so they must be
-// shed with 503 + Retry-After rather than surfaced as a raw 500.
+// Messages node-postgres throws on pool exhaustion.
 const POOL_EXHAUSTION_PATTERNS = [
   /timeout exceeded when trying to connect/i,
   /too many clients already/i,
@@ -20,14 +15,7 @@ function matchesPoolExhaustionPattern(message: string): boolean {
   return POOL_EXHAUSTION_PATTERNS.some((pattern) => pattern.test(message));
 }
 
-// Drizzle wraps driver errors as `DrizzleQueryError`, and -- depending on the exact internal
-// code path a given query takes -- sometimes folds the underlying pg-pool message into its own
-// `.message` and sometimes leaves it only on `.cause` (Node's standard Error cause-chaining).
-// Checking `.message` alone under-detects: GET /logs and GET /logs/aggregate (both go through
-// Drizzle) were measured falling through to a raw 500 instead of the correct 503+Retry-After
-// under the exact same pool-exhaustion condition that POST /logs (raw pg.Pool, no Drizzle
-// wrapping, no `.cause` layer) always classified correctly. Walk the cause chain, bounded to
-// guard against a pathological cycle.
+// Walks error.cause: Drizzle sometimes buries the real message there.
 function isPoolExhaustionError(error: unknown): boolean {
   let current: unknown = error;
 
@@ -51,8 +39,6 @@ export function buildApp() {
   });
 
   app.setErrorHandler((error, request, reply) => {
-    // Fastify types the handler's error as `unknown`; every error reaching it is
-    // a FastifyError, whose `statusCode` is set for errors it raised itself.
     const fastifyError = error as FastifyError;
 
     if (fastifyError.code === "FST_ERR_CTP_INVALID_JSON_BODY") {
@@ -72,8 +58,6 @@ export function buildApp() {
 
     request.log.error(error);
 
-    // Client errors carry a usable message; anything else is an internal fault
-    // whose details must not reach the caller.
     const clientStatusCode =
       fastifyError.statusCode && fastifyError.statusCode < 500
         ? fastifyError.statusCode

@@ -10,12 +10,7 @@ if (!databaseUrl) {
   throw new Error("DATABASE_URL is not defined");
 }
 
-// Two separate pools share the same PostgreSQL instance but are never mixed: ingestion (COPY
-// holds one connection for a whole batch, so it needs its own budget) and query/health/retention
-// (short statements that must stay responsive even while ingestion is saturating the ingest
-// pool). A single shared pool lets a burst of concurrent POST /logs requests starve
-// GET /logs/aggregate behind the same connections — measured directly in
-// specs/001-benchmark-perf-gap/diagnostics.md, and the motivation for this split.
+// Separate pools — ingestion bursts can't starve queries.
 export const ingestPool = new Pool({
   connectionString: databaseUrl,
   max: env.dbIngestPoolMax,
@@ -30,12 +25,7 @@ export const queryPool = new Pool({
   connectionTimeoutMillis: env.dbQueryPoolConnectTimeoutMs,
 });
 
-// A third, tiny, dedicated pool for GET /health only. Measured directly: under the sustained
-// high-concurrency load this service is now tuned to survive, /health (sharing queryPool) saw
-// latency spike up to 6.3s -- longer than docker-compose.yml's healthcheck `timeout: 3s`, which
-// risks the container being marked unhealthy from pure query contention, not an actual outage.
-// A liveness probe must never queue behind application load; its own timeout is short on
-// purpose so a genuinely unreachable database is still reported quickly.
+// Dedicated pool so /health never queues behind application load.
 export const healthPool = new Pool({
   connectionString: databaseUrl,
   max: 2,

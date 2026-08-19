@@ -9,8 +9,7 @@ import type {
   RejectedLog,
 } from "../types/log.types.js";
 
-// Single app-wide instance: coalescing only helps when concurrent requests
-// share one window, which requires one coalescer serving all of them.
+// One instance app-wide, so concurrent requests share coalescing windows.
 const coalescer = new IngestCoalescer(
   env.ingestCoalesceWindowMs,
   env.ingestCoalesceMaxBatchEntries,
@@ -26,10 +25,6 @@ function hasLogsArray(body: unknown): body is LogsRequest {
   );
 }
 
-/**
- * Validates a batch entry by entry and persists whatever survives. Invalid
- * entries never block the valid ones — they are reported back by index.
- */
 export async function ingestLogs(body: unknown): Promise<IngestResult> {
   if (!hasLogsArray(body)) {
     return {

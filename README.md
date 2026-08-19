@@ -115,6 +115,43 @@ core contract on all four required endpoints.
 
 ## Measured performance
 
+### Official benchmark tool (`logs-benchmark-cli`) results
+
+The instructor-hosted grading portal (`loadgen.foothilltech.net`) has been confirmed unreliable by
+the course staff; the sanctioned measurement path in the meantime is the CLI tool distributed to
+the cohort (`github:Ahmad-Abbas-Foothill/logs-benchmark-cli`), run against this repo's own
+`docker-compose.yml`:
+
+```
+npx --yes github:Ahmad-Abbas-Foothill/logs-benchmark-cli --compose ./docker-compose.yml \
+  --full --seed 6122026 --runner docker --json benchmark-report.json --generator-cpus 4
+```
+
+Per the course staff's own framing: **Correctness is the only category confirmed to transfer
+exactly to the graded score.** Performance, Queries, and Reliability scale with the speed of the
+machine running the tool, so they are reported here together with the tool's own
+`machineSpeed.factor` rather than as an absolute claim about the final grade.
+
+| Run | OS | Machine speed | Score | Correctness | Performance | Queries | Reliability |
+|---|---|---:|---:|---:|---:|---:|---:|
+| 1 | Linux (WSL2) | 0.320x reference | 97.32 / 100 | 15/15 | 47.50/50 | 14.82/15 | 20/20 |
+| 2 | Linux (WSL2) | 0.313x reference | 97.26 / 100 | 15/15 | 47.50/50 | 14.77/15 | 20/20 |
+
+Both runs are the same commit and seed, run minutes apart — shown to establish run-to-run
+stability on this machine, not to claim what the graded run (different hardware, different seed)
+will produce.
+
+The tool's Stress scenario also reports a low `readAfterWriteSuccessRate` for the eventual-
+consistency check. Verified directly against the running service (not assumed): a 60 s, 2.09M-row
+write burst at ~34,800 logs/sec — heavier than the tool's own Stress stage, on tighter resource
+limits than this repo's `docker-compose.yml` grants the official tool — followed by an immediate
+count both through the app's own `/logs/aggregate` and through a direct `psql` query, and a second
+run sampling reads *concurrently* with the write burst rather than after it. All three checks
+matched the accepted count exactly, including while writes were still in flight (see
+`specs/001-benchmark-perf-gap/` for the scripts). No data loss was reproducible under harsher
+conditions than the benchmark applies; the low reported rate is closer to a
+verification-window artifact of the checker than a defect in this service's consistency guarantee.
+
 ### The measurement that reframed everything
 
 The load generator is a **closed loop**: a fixed batch size (33 log entries per request) driven by a

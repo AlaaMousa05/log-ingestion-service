@@ -12,24 +12,15 @@ import {
 import { decodeCursor } from "../utils/cursor.js";
 import { parseIsoTimestamp } from "../utils/timestamp.js";
 
-/** Query parameters prefixed with this filter on a single log attribute: `?attr.user_id=42`. */
 const ATTRIBUTE_PREFIX = "attr.";
 
 const DEFAULT_LIMIT = 100;
 const MAX_LIMIT = 1_000;
 
-/**
- * Parsed query parameters, or the message to return with a 400. Controllers
- * translate this into a response; nothing in here knows about HTTP itself.
- */
 export type ParseResult<T> =
   | { ok: true; value: T }
   | { ok: false; error: string };
 
-/**
- * A query string after the single-value check: repeated parameters (which Fastify
- * surfaces as arrays) have already been rejected, so every value is a string.
- */
 type RawQuery = Record<string, string | undefined>;
 
 function ok<T>(value: T): ParseResult<T> {
@@ -40,10 +31,7 @@ function invalid<T>(error: string): ParseResult<T> {
   return { ok: false, error };
 }
 
-/**
- * Rejects repeated query parameters. `?level=info&level=error` arrives as an
- * array, which no filter below is prepared to handle.
- */
+// Rejects repeated params (?level=a&level=b arrives as an array).
 function toSingleValueQuery(rawQuery: unknown): RawQuery | null {
   const query = rawQuery as Record<string, unknown>;
 
@@ -54,7 +42,6 @@ function toSingleValueQuery(rawQuery: unknown): RawQuery | null {
   return query as RawQuery;
 }
 
-/** Empty parameters (`?level=`) are treated as absent rather than as invalid input. */
 function isPresent(value: string | undefined): value is string {
   return value !== undefined && value !== "";
 }
@@ -114,10 +101,6 @@ function parseCursor(
   return ok({ timestamp, id: decoded.id });
 }
 
-/**
- * Validates the GET /logs query string. `limit` is the caller's requested page
- * size; the pagination look-ahead is the controller's concern.
- */
 export function parseLogQuery(rawQuery: unknown): ParseResult<LogQuery> {
   const query = toSingleValueQuery(rawQuery);
 
@@ -183,7 +166,6 @@ export function parseLogQuery(rawQuery: unknown): ParseResult<LogQuery> {
   });
 }
 
-/** Validates the GET /logs/aggregate query string, where the time window is mandatory. */
 export function parseAggregateQuery(rawQuery: unknown): ParseResult<AggregateQuery> {
   const query = toSingleValueQuery(rawQuery);
 

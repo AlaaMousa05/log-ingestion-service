@@ -9,10 +9,6 @@ import {
 
 type LogRow = Awaited<ReturnType<typeof findLogs>>[number];
 
-/**
- * `id` and `timestamp` already arrive in their response form (see findLogs), so
- * this only picks fields — no per-row BigInt or Date conversion.
- */
 function serializeLog(log: LogRow) {
   return {
     id: log.id,
@@ -61,8 +57,7 @@ export async function queryLogsController(
 
   const query = parsed.value;
 
-  // The repository returns exactly its requested limit. The controller owns
-  // the one-row look-ahead needed to generate a next cursor.
+  // Extra row requested as a page-exists look-ahead.
   const rows = await findLogs({ ...query, limit: query.limit + 1 });
 
   const hasMore = rows.length > query.limit;

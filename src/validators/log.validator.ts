@@ -6,10 +6,7 @@ import {
 } from "../types/log.types.js";
 import { parseIsoTimestamp } from "../utils/timestamp.js";
 
-/**
- * Clock skew between the caller and this service is expected, so timestamps are
- * allowed to run slightly ahead of now before being rejected as bogus.
- */
+// Tolerates expected clock skew between caller and this service.
 const MAX_FUTURE_MS = 5 * 60 * 1000;
 
 export type ValidationResult =
@@ -20,7 +17,7 @@ function invalid(reason: string): ValidationResult {
   return { valid: false, reason };
 }
 
-/** PostgreSQL text columns cannot store NUL, so entries carrying one are rejected. */
+// Postgres text columns can't store a NUL byte.
 function containsNullCharacter(value: string): boolean {
   return value.includes("\0");
 }
